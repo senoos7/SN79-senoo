@@ -95,12 +95,26 @@ MINERS=(
 
 `-` means "use `DEFAULT_WALLET_NAME` / `DEFAULT_AGENT_NAME`".
 
-Start, **always** passing your VPS public IP via `AXON_EXTERNAL_IP` (validators
-need to reach the axon; on cloud VPS the NIC usually shows a private IP):
+Start the miner. By default the script **auto-detects this VPS's public IPv4**
+by hitting `api.ipify.org` / `ifconfig.me` / `ipinfo.io` / `icanhazip.com` /
+`checkip.amazonaws.com` (first valid response wins) and passes it as
+`--axon.external_ip`. This avoids the common VPS pitfall where the NIC has a
+private NAT'd IP and validators can't reach the axon.
 
 ```bash
 cd ~/sn-79
-AXON_EXTERNAL_IP=<your.public.ip> ./scripts/miner/run/run_multi_miner_sn79.sh start
+./scripts/miner/run/run_multi_miner_sn79.sh start
+```
+
+You can still override manually:
+
+```bash
+# force a specific IP (e.g. behind a proxy / floating IP setup)
+AXON_EXTERNAL_IP=1.2.3.4 ./scripts/miner/run/run_multi_miner_sn79.sh start
+
+# OR disable auto-detect and let bittensor pick from NIC
+# (only safe when the NIC already shows the public IP)
+AXON_EXTERNAL_IP="" ./scripts/miner/run/run_multi_miner_sn79.sh start
 ```
 
 Other commands:

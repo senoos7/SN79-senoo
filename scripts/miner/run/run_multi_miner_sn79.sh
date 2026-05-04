@@ -55,10 +55,13 @@ DEFAULT_AGENT_NAME="${DEFAULT_AGENT_NAME:-AdaptiveMarketMakerAgent}"
 # Override: SUBTENSOR_ENDPOINT=wss://... ./run_multi_miner_sn79.sh start
 SUBTENSOR_ENDPOINT="${SUBTENSOR_ENDPOINT:-wss://entrypoint-finney.opentensor.ai:443}"
 
-# Public IP of this VPS - REQUIRED when the NIC shows a private IP (10.x / 172.x / 192.168.x).
-# Without this, the miner registers a private IP on-chain and validators cannot reach it -> 0 queries.
-# Override: AXON_EXTERNAL_IP=1.2.3.4 ./run_multi_miner_sn79.sh start
-AXON_EXTERNAL_IP="${AXON_EXTERNAL_IP:-}"
+# Public IPv4 of this VPS - the miner advertises this on-chain so validators can reach it.
+# By default we auto-detect via public IP services (api.ipify.org / ifconfig.me / etc).
+# Override manually if you want, e.g.:
+#   AXON_EXTERNAL_IP=1.2.3.4 ./run_multi_miner_sn79.sh start
+# Set AXON_EXTERNAL_IP=auto (the default) to force auto-detection, or empty string to
+# fall back to bittensor's own auto-detect (NOT recommended on NAT'd VPS - it picks the NIC).
+AXON_EXTERNAL_IP="${AXON_EXTERNAL_IP:-auto}"
 
 # Wallet directory (matches bittensor default).
 WALLET_PATH="${WALLET_PATH:-$HOME/.bittensor/wallets/}"
@@ -128,6 +131,51 @@ require_python() {
   fi
 }
 
+# Detect the VPS public IPv4 by hitting a few public IP services with short timeouts.
+# Echoes the IP on stdout if found, or empty string. Validates the result is a valid IPv4.
+detect_public_ipv4() {
+  local ip=""
+  local urls=(
+    "https://api.ipify.org"
+    "https://ifconfig.me"
+    "https://ipinfo.io/ip"
+    "https://icanhazip.com"
+    "https://checkip.amazonaws.com"
+  )
+  for url in "${urls[@]}"; do
+    ip=$(curl -s -4 --max-time 3 "$url" 2>/dev/null | tr -d '[:space:]')
+    if [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+      echo "$ip"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Resolve AXON_EXTERNAL_IP. Modes:
+#   "auto"  -> auto-detect via public services (default)
+#   ""      -> let bittensor auto-detect from NIC (only safe if NIC has the public IP)
+#   <ipv4>  -> use as-is
+resolve_axon_external_ip() {
+  if [ "$AXON_EXTERNAL_IP" = "auto" ]; then
+    if ! command -v curl >/dev/null 2>&1; then
+      echo "WARN: curl not installed; cannot auto-detect public IP. Falling back to bittensor auto-detect."
+      AXON_EXTERNAL_IP=""
+      return 0
+    fi
+    echo "Auto-detecting public IPv4..."
+    local detected
+    detected=$(detect_public_ipv4 || true)
+    if [ -n "$detected" ]; then
+      AXON_EXTERNAL_IP="$detected"
+      echo "  Detected: $AXON_EXTERNAL_IP"
+    else
+      echo "  WARN: auto-detect failed (all services unreachable). Falling back to bittensor auto-detect."
+      AXON_EXTERNAL_IP=""
+    fi
+  fi
+}
+
 # Parse a miner entry into named variables.
 # Sets: _WALLET, _HOTKEY, _PORT, _PM2_NAME, _AGENT_NAME, _AGENT_PARAMS
 parse_miner_entry() {
@@ -182,9 +230,12 @@ start_all() {
   require_python
   export PYTHONPATH="$REPO_ROOT"
 
+  resolve_axon_external_ip
+
   if [ -z "$AXON_EXTERNAL_IP" ]; then
-    echo "WARN: AXON_EXTERNAL_IP not set. If this VPS has a private NIC IP, validators won't reach the axon."
-    echo "      Re-run with:  AXON_EXTERNAL_IP=<your.public.ip> $0 start"
+    echo "WARN: No external IP set or detected. Bittensor will auto-pick from NIC,"
+    echo "      which on a NAT'd VPS yields a private IP -> validators cannot reach the axon."
+    echo "      Override:  AXON_EXTERNAL_IP=<your.public.ip> $0 start"
     echo
   fi
 
@@ -257,7 +308,13 @@ list_miners() {
   echo
   echo "Defaults: wallet=$DEFAULT_WALLET_NAME  agent=$DEFAULT_AGENT_NAME  netuid=$NETUID"
   echo "Endpoint: $SUBTENSOR_ENDPOINT"
-  echo "Axon ext: ${AXON_EXTERNAL_IP:-<unset, will auto-detect>}"
+  if [ "$AXON_EXTERNAL_IP" = "auto" ]; then
+    echo "Axon ext: auto-detect via public IP services at start"
+  elif [ -z "$AXON_EXTERNAL_IP" ]; then
+    echo "Axon ext: <unset> (bittensor will pick from NIC)"
+  else
+    echo "Axon ext: $AXON_EXTERNAL_IP"
+  fi
   echo "Python:   $PYTHON"
   echo "Miner:    $MINER_SCRIPT"
   echo "Agents:   $AGENT_PATH"
