@@ -41,8 +41,10 @@ else
   PYTHON="${PYTHON:-$(which python3)}"
 fi
 
-# Agent definitions live here (default location used by install_vps.sh).
-AGENT_PATH="${AGENT_PATH:-$HOME/.taos/agents}"
+# Agent definitions live here. Default = the agents/ dir in the cloned repo, so
+# new agents added via `git pull` are picked up automatically with no copy step.
+# Override to e.g. ~/.taos/agents if you keep custom strategies outside the repo.
+AGENT_PATH="${AGENT_PATH:-$REPO_ROOT/agents}"
 
 # Default agent class to load when a miner entry has no 5th field or "-".
 # AdaptiveMarketMakerAgent -> custom inventory-managed MM with stop-loss (this repo)
@@ -126,7 +128,14 @@ require_python() {
   fi
   if [ ! -d "$AGENT_PATH" ]; then
     echo "Error: agent path $AGENT_PATH does not exist."
-    echo "Run scripts/setup/install_vps.sh first, or copy agents/*.py there manually."
+    echo "If you cloned the repo, the agents/ directory should already exist there."
+    echo "Try:  cd $REPO_ROOT && git pull"
+    echo "Or override with:  AGENT_PATH=/path/to/your/agents $0 start"
+    exit 1
+  fi
+  if ! ls "$AGENT_PATH"/*.py >/dev/null 2>&1; then
+    echo "Error: no .py agent files found in $AGENT_PATH"
+    echo "Try:  cd $REPO_ROOT && git pull"
     exit 1
   fi
 }

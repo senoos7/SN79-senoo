@@ -34,9 +34,13 @@ This installs (idempotently):
 - Node.js LTS, `pm2`, `pm2-logrotate`
 - `uv`, then a Python 3.10.9 venv at `./.venv`
 - The `taos` package (`pip install -e .`)
-- Example agents copied to `~/.taos/agents`
+- (Optional) populates the legacy `~/.taos/agents` for compatibility with the
+  upstream `run_miner.sh`. The new `run_multi_miner_sn79.sh` reads agents
+  directly from the repo's `agents/` directory, so a `git pull` is enough to
+  get new agents — no copy step needed.
 
-Smoke test at the end imports `taos` + `bittensor` to confirm the venv works.
+Smoke test at the end imports `taos` + `bittensor` and validates the custom
+`AdaptiveMarketMakerAgent.py` parses cleanly.
 
 ---
 
@@ -158,9 +162,9 @@ Re-check `AXON_EXTERNAL_IP` and that the port is reachable from outside
 
 ## 5. Switching agents
 
-The shipped sample agents (in `~/.taos/agents/`) are not expected to win — see
-the SN-79 README and FAQ. They're fine to **keep your hotkey alive and producing
-activity** while you develop a better one.
+The shipped sample agents (in the repo's `agents/` directory) are not expected
+to win — see the SN-79 README and FAQ. They're fine to **keep your hotkey
+alive and producing activity** while you develop a better one.
 
 To switch to a different sample, change the 5th column of the miner row in
 `run_multi_miner_sn79.sh`:
@@ -171,8 +175,9 @@ To switch to a different sample, change the 5th column of the miner row in
 
 To deploy a **custom agent**:
 
-1. Drop `MyAgent.py` into `~/.taos/agents/` (or scp it from your dev box).
-   It must define a class `MyAgent` inheriting from `FinanceSimulationAgent`.
+1. Drop `MyAgent.py` into the repo's `agents/` directory (or scp it from your
+   dev box). It must define a class `MyAgent` inheriting from
+   `FinanceSimulationAgent`.
 2. Add an entry to the `AGENT_PARAMS` associative array at the top of
    `run_multi_miner_sn79.sh`:
 

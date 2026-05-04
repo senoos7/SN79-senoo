@@ -102,23 +102,34 @@ python -m pip install -q --upgrade pyopenssl cryptography
 log "Installing taos (editable) from $REPO_ROOT"
 python -m pip install -e "$REPO_ROOT"
 
-# ---------- 6. Copy example agents ----------
-log "Copying example agents to $AGENT_DIR"
-mkdir -p "$AGENT_DIR"
-cp -r "$REPO_ROOT/agents/"*.py "$AGENT_DIR/"
-log "Agents available at $AGENT_DIR:"
-ls -1 "$AGENT_DIR" | sed 's/^/  - /'
+# ---------- 6. Verify agents directory in the repo ----------
+# The runner script uses $REPO_ROOT/agents directly, so no copy is needed.
+# This block is kept as a sanity check + summary for the operator.
+if [ -d "$REPO_ROOT/agents" ]; then
+  log "Agents available at $REPO_ROOT/agents:"
+  ls -1 "$REPO_ROOT/agents" | grep '\.py$' | sed 's/^/  - /'
+else
+  warn "agents/ directory missing from $REPO_ROOT - the repo may be incomplete."
+fi
+# Optional: also populate $AGENT_DIR (~/.taos/agents) for backwards compatibility
+# with run_miner.sh and any scripts that still expect that path.
+if [ "${POPULATE_LEGACY_AGENT_DIR:-1}" = "1" ]; then
+  log "Also populating legacy path $AGENT_DIR (set POPULATE_LEGACY_AGENT_DIR=0 to skip)"
+  mkdir -p "$AGENT_DIR"
+  cp "$REPO_ROOT/agents/"*.py "$AGENT_DIR/" 2>/dev/null || true
+fi
 
 # ---------- 7. Quick smoke test ----------
 log "Importing taos to verify install"
 python -c "import taos, bittensor; print(f'  taos {taos.__version__}, bittensor {bittensor.__version__}')"
 
 # Sanity-check that the custom AdaptiveMarketMakerAgent at least parses + imports.
-if [ -f "$AGENT_DIR/AdaptiveMarketMakerAgent.py" ]; then
+AGENT_FILE="$REPO_ROOT/agents/AdaptiveMarketMakerAgent.py"
+if [ -f "$AGENT_FILE" ]; then
   log "Sanity-checking AdaptiveMarketMakerAgent.py"
   python -c "
 import importlib.util, sys
-spec = importlib.util.spec_from_file_location('AdaptiveMarketMakerAgent', '$AGENT_DIR/AdaptiveMarketMakerAgent.py')
+spec = importlib.util.spec_from_file_location('AdaptiveMarketMakerAgent', '$AGENT_FILE')
 mod = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(mod)
 assert hasattr(mod, 'AdaptiveMarketMakerAgent'), 'class missing'
