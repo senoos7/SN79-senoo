@@ -36,7 +36,11 @@ Strategy parameters (pass via --agent.params on the miner command line):
   inventory_cap_pct=0.10  hard cap on |inventory| as fraction of per-book wealth
   stop_loss_pct=0.005     close inventory when realized+unrealized loss > 0.5% of capital
   vol_pause_pct=0.70      pull quotes when traded_volume > 70% of cap
-  expiry_seconds=4        GTT expiry of resting quotes (sim seconds)
+  expiry_seconds=30       GTT expiry of resting quotes (sim seconds). MUST be larger than
+                          the validator's publish_interval (~5s on mainnet) plus any
+                          set_delays() overhead, otherwise our cancels routinely arrive
+                          AFTER the order has auto-expired -> "Order IDs do not exist"
+                          spam in logs and our smart-requote logic becomes a no-op.
   requote_tolerance_pct=0.0003  re-quote only if target shifts > 3 bps
   capital_turnover_cap=1.0      mirror of validator scoring.activity.capital_turnover_cap
 
@@ -112,7 +116,7 @@ class AdaptiveMarketMakerAgent(FinanceSimulationAgent):
         self.inventory_cap_pct: float = float(getattr(c, "inventory_cap_pct", 0.10))
         self.stop_loss_pct: float = float(getattr(c, "stop_loss_pct", 0.005))
         self.vol_pause_pct: float = float(getattr(c, "vol_pause_pct", 0.70))
-        self.expiry_seconds: int = int(getattr(c, "expiry_seconds", 4))
+        self.expiry_seconds: int = int(getattr(c, "expiry_seconds", 30))
         self.requote_tolerance_pct: float = float(getattr(c, "requote_tolerance_pct", 0.0003))
         self.capital_turnover_cap: float = float(getattr(c, "capital_turnover_cap", 1.0))
 
@@ -426,6 +430,6 @@ if __name__ == "__main__":
     Standalone test against the local proxy. From inside `agents/`:
       python AdaptiveMarketMakerAgent.py --port 8888 --agent_id 0 \
           --params base_qty=0.5 base_half_spread=0.0008 gamma=20.0 \
-                   stop_loss_pct=0.005 vol_pause_pct=0.70 expiry_seconds=4
+                   stop_loss_pct=0.005 vol_pause_pct=0.70 expiry_seconds=30
     """
     launch(AdaptiveMarketMakerAgent)

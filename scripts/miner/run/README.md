@@ -255,7 +255,7 @@ function in `taos/im/validator/reward.py`:
 | `inventory_cap_pct` | `0.10` | Hard cap on \|inventory\| / per-book capital. |
 | `stop_loss_pct` | `0.005` | Flatten inventory if MTM loss > 0.5% of per-book capital. |
 | `vol_pause_pct` | `0.70` | Stop quoting once traded_volume reaches 70% of cap. |
-| `expiry_seconds` | `4` | GTT expiry of resting quotes (sim seconds). |
+| `expiry_seconds` | `30` | GTT expiry of resting quotes (sim seconds). MUST exceed `publish_interval` (~5s on mainnet) plus the validator's `set_delays` overhead, otherwise our quotes auto-expire before our cancel/re-quote can land — you'll see "Order IDs do not exist" spam in logs and lose activity volume. |
 | `requote_tolerance_pct` | `0.0003` | Re-quote only if target shifts > 3 bps. |
 | `capital_turnover_cap` | `1.0` | Mirror of `scoring.activity.capital_turnover_cap`. |
 
@@ -299,7 +299,7 @@ cd agents/proxy && python proxy.py --config config.json
 # 2) Agent
 cd agents && python AdaptiveMarketMakerAgent.py --port 8888 --agent_id 0 \
     --params base_qty=0.5 base_half_spread=0.0008 gamma=20.0 \
-             stop_loss_pct=0.005 vol_pause_pct=0.70 expiry_seconds=4
+             stop_loss_pct=0.005 vol_pause_pct=0.70 expiry_seconds=30
 
 # 3) Simulator
 cd simulate/trading/run && ../build/src/cpp/taosim -f config/simulation_0.xml
