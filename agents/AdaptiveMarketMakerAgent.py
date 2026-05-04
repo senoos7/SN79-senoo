@@ -31,17 +31,19 @@ Mechanics:
 Strategy parameters (pass via --agent.params on the miner command line):
   base_qty=0.5            base order size in BASE per side
   base_half_spread=0.0008 fraction of mid added each side; 8 bps default
-  gamma=20.0              inventory aversion (higher = lean harder when long/short)
+  gamma=8.0               inventory aversion + vol-driven spread widening
   vol_window=64           EWMA samples for sigma estimation
   inventory_cap_pct=0.10  hard cap on |inventory| as fraction of per-book wealth
   stop_loss_pct=0.005     close inventory when realized+unrealized loss > 0.5% of capital
   vol_pause_pct=0.70      pull quotes when traded_volume > 70% of cap
-  expiry_seconds=30       GTT expiry of resting quotes (sim seconds). MUST be larger than
-                          the validator's publish_interval (~5s on mainnet) plus any
-                          set_delays() overhead, otherwise our cancels routinely arrive
-                          AFTER the order has auto-expired -> "Order IDs do not exist"
-                          spam in logs and our smart-requote logic becomes a no-op.
-  requote_tolerance_pct=0.0003  re-quote only if target shifts > 3 bps
+  expiry_seconds=30       GTT expiry of resting quotes (sim seconds). MUST exceed
+                          validator publish_interval (~5s) plus set_delays overhead.
+  max_half_spread_pct=0.005   ceiling on half-spread (0.5% of mid). Prevents EWMA
+                          blowups on noisy books from quoting 20%+ wide and never
+                          filling. Total quoted spread <= 2 * max_half_spread_pct.
+  requote_tolerance_pct=0.0015  re-quote only if target shifts > 15 bps. Heavily
+                          influences instruction count per response: 3 bps caused
+                          ~768 instr/response -> 4.5s decompression on validator.
   capital_turnover_cap=1.0      mirror of validator scoring.activity.capital_turnover_cap
 
 The defaults assume the live SN-79 simulation starting capital and decimal precision
@@ -111,13 +113,25 @@ class AdaptiveMarketMakerAgent(FinanceSimulationAgent):
         # Strategy parameters (all overridable via --agent.params)
         self.base_qty: float = float(getattr(c, "base_qty", 0.5))
         self.base_half_spread: float = float(getattr(c, "base_half_spread", 0.0008))
-        self.gamma: float = float(getattr(c, "gamma", 20.0))
+        # gamma drives Avellaneda-Stoikov inventory skew AND vol-driven spread widening.
+        # gamma=20 was too aggressive: on noisy books, sigma^2 EWMA spikes blew the
+        # quoted spread out to 20-35% of mid (we observed bids @ 181 / asks @ 383 on
+        # a 290 mid). gamma=8 keeps spreads workable while still skewing for inventory.
+        self.gamma: float = float(getattr(c, "gamma", 8.0))
         self.vol_window: int = int(getattr(c, "vol_window", 64))
         self.inventory_cap_pct: float = float(getattr(c, "inventory_cap_pct", 0.10))
         self.stop_loss_pct: float = float(getattr(c, "stop_loss_pct", 0.005))
         self.vol_pause_pct: float = float(getattr(c, "vol_pause_pct", 0.70))
         self.expiry_seconds: int = int(getattr(c, "expiry_seconds", 30))
-        self.requote_tolerance_pct: float = float(getattr(c, "requote_tolerance_pct", 0.0003))
+        # Hard cap on half-spread as a fraction of mid. Quotes wider than this on
+        # volatile books simply never get filled, so we'd rather under-protect a
+        # bit and actually trade than quote at 25% wide and earn zero RT volume.
+        self.max_half_spread_pct: float = float(getattr(c, "max_half_spread_pct", 0.005))
+        # Re-quote only when target moves more than this fraction of mid. 3 bps
+        # was too tight (we re-quoted on every cycle on every book -> 768 instr
+        # per response -> 4.5s decompression -> max latency penalty). 15 bps lets
+        # quotes rest passively and slashes wire payload.
+        self.requote_tolerance_pct: float = float(getattr(c, "requote_tolerance_pct", 0.0015))
         self.capital_turnover_cap: float = float(getattr(c, "capital_turnover_cap", 1.0))
 
         # Per-book persistent state. Reset on simulation start.
@@ -126,8 +140,9 @@ class AdaptiveMarketMakerAgent(FinanceSimulationAgent):
         bt.logging.info(
             "AdaptiveMarketMakerAgent initialized | "
             f"base_qty={self.base_qty} half_spread={self.base_half_spread} "
-            f"gamma={self.gamma} stop_loss_pct={self.stop_loss_pct} "
-            f"vol_pause_pct={self.vol_pause_pct} expiry_s={self.expiry_seconds}"
+            f"max_half_spread_pct={self.max_half_spread_pct} gamma={self.gamma} "
+            f"stop_loss_pct={self.stop_loss_pct} vol_pause_pct={self.vol_pause_pct} "
+            f"expiry_s={self.expiry_seconds} requote_tol={self.requote_tolerance_pct}"
         )
 
     # ------------------------------------------------------------------
@@ -332,15 +347,22 @@ class AdaptiveMarketMakerAgent(FinanceSimulationAgent):
             inv_skew = self.gamma * bs.inventory * sigma2
             reservation = micro - inv_skew * mid  # sigma2 is dimensionless; scale by mid
             half_spread = self.base_half_spread * mid + self.gamma * sigma2 * mid
-            # Enforce minimum half-spread of 1 tick to be marketable but profitable
+            # Enforce floor of 1 tick AND ceiling of max_half_spread_pct of mid so
+            # noisy books with EWMA spikes don't quote 20%+ wide and never get filled.
             half_spread = max(half_spread, 2 * tick)
+            half_spread = min(half_spread, self.max_half_spread_pct * mid)
 
             target_buy = self._round_price(reservation - half_spread)
             target_sell = self._round_price(reservation + half_spread)
 
-            # Make sure quotes never cross the book and are post-only-able.
-            target_buy = min(target_buy, bid)        # post-only buy: must be <= best_bid
-            target_sell = max(target_sell, ask)      # post-only sell: must be >= best_ask
+            # POST-ONLY safety: a buy must NOT be >= ask (else it crosses and becomes
+            # a taker), a sell must NOT be <= bid. Capping buy at ask-tick / sell at
+            # bid+tick lets our quotes sit INSIDE the existing bid-ask spread and
+            # become the new best bid/ask — front of the priority queue. (Capping at
+            # bid/ask, the previous behavior, parked us at the back of an existing
+            # queue and we essentially never got filled.)
+            target_buy = min(target_buy, ask - tick)
+            target_sell = max(target_sell, bid + tick)
             # And keep them non-crossing each other.
             if target_sell <= target_buy:
                 target_sell = self._round_price(target_buy + tick)
@@ -429,7 +451,8 @@ if __name__ == "__main__":
     """
     Standalone test against the local proxy. From inside `agents/`:
       python AdaptiveMarketMakerAgent.py --port 8888 --agent_id 0 \
-          --params base_qty=0.5 base_half_spread=0.0008 gamma=20.0 \
-                   stop_loss_pct=0.005 vol_pause_pct=0.70 expiry_seconds=30
+          --params base_qty=0.5 base_half_spread=0.0008 gamma=8.0 \
+                   stop_loss_pct=0.005 vol_pause_pct=0.70 expiry_seconds=30 \
+                   max_half_spread_pct=0.005 requote_tolerance_pct=0.0015
     """
     launch(AdaptiveMarketMakerAgent)
