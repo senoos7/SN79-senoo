@@ -48,9 +48,7 @@ from __future__ import annotations
 
 import math
 import time
-from collections import deque
-from dataclasses import dataclass, field
-from typing import Deque, Dict, Optional
+from typing import Dict
 
 import bittensor as bt
 
@@ -68,19 +66,36 @@ from taos.im.protocol.models import (
 # ---------------------------------------------------------------------------
 # Per-book state container
 # ---------------------------------------------------------------------------
-@dataclass
+# NOTE: We deliberately do NOT use @dataclass here. The miner base class loads
+# this module via importlib.util.spec_from_file_location + exec_module without
+# registering the module in sys.modules first (taos/common/neurons/miner.py:90-92).
+# When @dataclass runs during exec it tries sys.modules[cls.__module__].__dict__,
+# which yields None.__dict__ -> AttributeError. Plain classes side-step that
+# entirely. This matches the pattern used by all shipped sample agents.
 class BookState:
     """Rolling per-book state that survives across state updates within a simulation."""
-    inventory: float = 0.0          # Net BASE position from our trades since last flatten
-    avg_cost: float = 0.0           # Volume-weighted average price of current inventory
-    cum_realized_pnl: float = 0.0   # Realized P&L on this book since simulation start (QUOTE)
-    last_mid: float = 0.0           # Last midprice observed (for volatility EWMA)
-    sigma2: float = 0.0             # EWMA variance of log-returns
-    return_buf: Deque[float] = field(default_factory=lambda: deque(maxlen=64))
-    last_buy_price: float = 0.0     # Most recent target buy price we quoted
-    last_sell_price: float = 0.0    # Most recent target sell price we quoted
-    paused_until_ts: int = 0        # Volume gate: pause new quotes until this sim time
-    stop_armed: bool = True         # Disable stop-loss briefly right after triggering
+    __slots__ = (
+        "inventory",         # Net BASE position from our trades since last flatten
+        "avg_cost",          # Volume-weighted average price of current inventory
+        "cum_realized_pnl",  # Realized P&L on this book since simulation start (QUOTE)
+        "last_mid",          # Last midprice observed (for volatility EWMA)
+        "sigma2",            # EWMA variance of log-returns
+        "last_buy_price",    # Most recent target buy price we quoted
+        "last_sell_price",   # Most recent target sell price we quoted
+        "paused_until_ts",   # Volume gate: pause new quotes until this sim time
+        "stop_armed",        # Disable stop-loss briefly right after triggering
+    )
+
+    def __init__(self) -> None:
+        self.inventory = 0.0
+        self.avg_cost = 0.0
+        self.cum_realized_pnl = 0.0
+        self.last_mid = 0.0
+        self.sigma2 = 0.0
+        self.last_buy_price = 0.0
+        self.last_sell_price = 0.0
+        self.paused_until_ts = 0
+        self.stop_armed = True
 
 
 class AdaptiveMarketMakerAgent(FinanceSimulationAgent):
@@ -201,7 +216,6 @@ class AdaptiveMarketMakerAgent(FinanceSimulationAgent):
         """EWMA log-return variance with span = self.vol_window."""
         if bs.last_mid > 0 and mid > 0:
             r = math.log(mid / bs.last_mid)
-            bs.return_buf.append(r)
             # EWMA with alpha = 2/(N+1)
             alpha = 2.0 / (self.vol_window + 1)
             bs.sigma2 = (1 - alpha) * bs.sigma2 + alpha * r * r
