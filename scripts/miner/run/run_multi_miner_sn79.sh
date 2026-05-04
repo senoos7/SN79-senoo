@@ -138,6 +138,27 @@ require_python() {
     echo "Try:  cd $REPO_ROOT && git pull"
     exit 1
   fi
+
+  # Preflight: $PYTHON must actually be able to import bittensor and taos.
+  # Without this check, pm2 will spawn a tight restart-crash loop on import errors.
+  if ! "$PYTHON" -c "import bittensor, taos" >/dev/null 2>&1; then
+    echo "Error: the chosen Python ($PYTHON) is missing the bittensor and/or taos packages."
+    echo
+    echo "Quick fixes:"
+    echo "  A) Use your existing bittensor env, e.g.:"
+    echo "       PYTHON=\$(which python) $0 start         # while that env is activated"
+    echo "       PYTHON=/path/to/your/env/bin/python $0 start"
+    echo "  B) Repair the repo's local venv:"
+    echo "       cd $REPO_ROOT"
+    echo "       source .venv/bin/activate"
+    echo "       pip install -e ."
+    echo "  C) Reinstall from scratch:"
+    echo "       cd $REPO_ROOT && ./scripts/setup/install_vps.sh"
+    echo
+    echo "Diagnostic:"
+    "$PYTHON" -c "import bittensor, taos" 2>&1 | sed 's/^/  /'
+    exit 1
+  fi
 }
 
 # Detect the VPS public IPv4 by hitting a few public IP services with short timeouts.
