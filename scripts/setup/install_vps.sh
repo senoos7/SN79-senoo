@@ -95,12 +95,15 @@ source "$VENV_DIR/bin/activate"
 log "Active python: $(python --version) at $(which python)"
 
 # ---------- 5. Install taos package ----------
-log "Upgrading pip + base TLS libs"
-python -m pip install -q --upgrade pip setuptools wheel
-python -m pip install -q --upgrade pyopenssl cryptography
+# IMPORTANT: `uv venv` does NOT install pip into the venv by default, so
+# `python -m pip ...` would fail with "No module named pip". We use `uv pip`
+# instead, which is uv's own pip-compatible installer and works without pip
+# being present in the venv. It's also significantly faster than pip.
+log "Installing TLS libs"
+uv pip install -q --upgrade pyopenssl cryptography
 
 log "Installing taos (editable) from $REPO_ROOT"
-python -m pip install -e "$REPO_ROOT"
+uv pip install -e "$REPO_ROOT"
 
 # ---------- 6. Verify agents directory in the repo ----------
 # The runner script uses $REPO_ROOT/agents directly, so no copy is needed.
