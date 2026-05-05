@@ -90,6 +90,8 @@ class BookState:
         "last_sell_price",   # Most recent target sell price we quoted
         "paused_until_ts",   # Volume gate: pause new quotes until this sim time
         "stop_armed",        # Disable stop-loss briefly right after triggering
+        "ewma_short",        # Short-window EWMA of mid (trend detection)
+        "ewma_long",         # Long-window EWMA of mid (trend detection)
     )
 
     def __init__(self) -> None:
@@ -102,6 +104,8 @@ class BookState:
         self.last_sell_price = 0.0
         self.paused_until_ts = 0
         self.stop_armed = True
+        self.ewma_short = 0.0
+        self.ewma_long = 0.0
 
 
 class AdaptiveMarketMakerAgent(FinanceSimulationAgent):
@@ -111,7 +115,12 @@ class AdaptiveMarketMakerAgent(FinanceSimulationAgent):
     def initialize(self):
         c = self.config
         # Strategy parameters (all overridable via --agent.params)
-        self.base_qty: float = float(getattr(c, "base_qty", 0.5))
+        # Per-fill size in BASE units. Smaller = less per-fill risk, more granular
+        # inventory control. With per_book_wealth ~$390 and mid ~$300, inv cap is
+        # ~0.65 BASE/book; base_qty=0.5 exhausted 77% of the cap on a single fill.
+        # 0.2 BASE = ~31% of cap per fill, so we get 3 fills before hitting the cap
+        # rather than 1. Smaller fills also mean smaller adverse-selection losses.
+        self.base_qty: float = float(getattr(c, "base_qty", 0.2))
         self.base_half_spread: float = float(getattr(c, "base_half_spread", 0.0008))
         # gamma drives Avellaneda-Stoikov inventory skew AND vol-driven spread widening.
         # gamma=20 was too aggressive: on noisy books, sigma^2 EWMA spikes blew the
@@ -119,12 +128,17 @@ class AdaptiveMarketMakerAgent(FinanceSimulationAgent):
         # a 290 mid). gamma=8 keeps spreads workable while still skewing for inventory.
         self.gamma: float = float(getattr(c, "gamma", 8.0))
         self.vol_window: int = int(getattr(c, "vol_window", 64))
-        # Inventory cap as fraction of per-book wealth. 0.10 was too tight: with
-        # base_qty=0.5 BASE per fill on a small per-book wealth, a single fill
-        # exceeded the cap, locking us into flatten-only mode on that side. Once
-        # the offsetting fill stalls (queue position, market drift), volume goes
-        # to zero. 0.50 lets ~5-10 fills stack before the gate kicks in.
-        self.inventory_cap_pct: float = float(getattr(c, "inventory_cap_pct", 0.50))
+        # Inventory cap as fraction of per-book wealth. Tighter cap = less max
+        # accumulation risk in trending markets. 0.20 lets us absorb a few fills
+        # before the gate fires. Combined with active-flattening below, this
+        # keeps |inventory| bounded even in one-way markets.
+        self.inventory_cap_pct: float = float(getattr(c, "inventory_cap_pct", 0.20))
+        # When |inventory| exceeds inv_cap * `flatten_threshold_mult`, we switch
+        # the offsetting side to AGGRESSIVE (top-of-queue) regardless of edge.
+        # This actually closes the position instead of just refusing to add to it.
+        # Without this, in a trend we accumulate inventory, hit the cap, refuse
+        # to add (correctly) but then sit indefinitely with the toxic position.
+        self.flatten_threshold_mult: float = float(getattr(c, "flatten_threshold_mult", 1.0))
         self.stop_loss_pct: float = float(getattr(c, "stop_loss_pct", 0.005))
         self.vol_pause_pct: float = float(getattr(c, "vol_pause_pct", 0.70))
         self.expiry_seconds: int = int(getattr(c, "expiry_seconds", 30))
@@ -150,6 +164,19 @@ class AdaptiveMarketMakerAgent(FinanceSimulationAgent):
         #   "deeper" -> still quote, but at mid +/- min_edge (behind the touch).
         #               Order may fill less often but each fill has guaranteed edge.
         self.min_edge_mode: str = str(getattr(c, "min_edge_mode", "deeper")).lower()
+        # Trend-detection circuit breaker. The single biggest cause of toxic
+        # accumulation is one-sided fills during a price trend: market grinds up,
+        # our deeper sell quotes get picked off as it crosses through them, our
+        # buy quotes sit below the rising market and never fill. We track a
+        # short EWMA vs a long EWMA of mid; when they diverge by more than
+        # `trend_pause_bps`, we PAUSE the side that the trend is hitting:
+        #   - Up trend (short_ewma > long_ewma * (1 + thresh)) -> pause sells.
+        #   - Down trend (short_ewma < long_ewma * (1 - thresh)) -> pause buys.
+        # Active flatten still runs (we still close excess inventory urgently),
+        # but we don't add NEW exposure into a trend.
+        self.trend_pause_bps: float = float(getattr(c, "trend_pause_bps", 8.0))
+        self.trend_ewma_short_alpha: float = float(getattr(c, "trend_ewma_short_alpha", 0.3))
+        self.trend_ewma_long_alpha: float = float(getattr(c, "trend_ewma_long_alpha", 0.05))
         self.capital_turnover_cap: float = float(getattr(c, "capital_turnover_cap", 1.0))
 
         # Per-book persistent state. Reset on simulation start.
@@ -261,6 +288,14 @@ class AdaptiveMarketMakerAgent(FinanceSimulationAgent):
             alpha = 2.0 / (self.vol_window + 1)
             bs.sigma2 = (1 - alpha) * bs.sigma2 + alpha * r * r
         bs.last_mid = mid
+        # Trend detection: short and long EWMAs of mid. Initialize to mid on
+        # the first cycle so the first trend reading isn't garbage.
+        if bs.ewma_short <= 0:
+            bs.ewma_short = mid
+            bs.ewma_long = mid
+        else:
+            bs.ewma_short = (1 - self.trend_ewma_short_alpha) * bs.ewma_short + self.trend_ewma_short_alpha * mid
+            bs.ewma_long = (1 - self.trend_ewma_long_alpha) * bs.ewma_long + self.trend_ewma_long_alpha * mid
 
     def _maybe_stop_loss(
         self,
@@ -333,6 +368,10 @@ class AdaptiveMarketMakerAgent(FinanceSimulationAgent):
             # Competitiveness: at-top vs deeper-passive.
             "buy_inside": 0, "sell_inside": 0,
             "buy_deeper": 0, "sell_deeper": 0,
+            # Active flatten: # books where we forced top-of-queue to close excess inv.
+            "urgent_flatten_buy": 0, "urgent_flatten_sell": 0,
+            # Trend gate: # books where we suppressed a side because of a trend.
+            "trend_paused_buy": 0, "trend_paused_sell": 0,
             "sum_traded_volume": 0.0,
         }
 
@@ -392,83 +431,118 @@ class AdaptiveMarketMakerAgent(FinanceSimulationAgent):
 
             # ----- 4. Avellaneda-Stoikov style reservation + spread -----
             sigma2 = bs.sigma2
-            inv_skew = self.gamma * bs.inventory * sigma2
-            reservation = micro - inv_skew * mid  # sigma2 is dimensionless; scale by mid
+            # Inventory skew in absolute price units (positive when long, so it
+            # subtracts from reservation -> quotes shift DOWN -> we sell more
+            # eagerly and buy more passively, encouraging flattening).
+            inv_skew_price = self.gamma * bs.inventory * sigma2 * mid
+            reservation = micro - inv_skew_price
             half_spread = self.base_half_spread * mid + self.gamma * sigma2 * mid
-            # Enforce floor of 1 tick AND ceiling of max_half_spread_pct of mid so
-            # noisy books with EWMA spikes don't quote 20%+ wide and never get filled.
             half_spread = max(half_spread, 2 * tick)
             half_spread = min(half_spread, self.max_half_spread_pct * mid)
 
-            target_buy = self._round_price(reservation - half_spread)
-            target_sell = self._round_price(reservation + half_spread)
+            # Model's "raw" preferred prices (already include inventory skew).
+            raw_buy = reservation - half_spread
+            raw_sell = reservation + half_spread
 
-            # COMPETITIVE QUOTING + EDGE GATE.
-            #
-            # Always-front-of-queue quoting (target = bid+tick / ask-tick) gives
-            # great fill rate but TERRIBLE adverse selection at zero edge.
-            # Always-deep quoting gives great edge but near-zero fill rate.
-            # The middle ground: quote at top-of-queue when the spread allows
-            # at least min_edge there; otherwise quote DEEPER at the edge level
-            # so we still leave a resting order with positive edge protection.
+            # Top-of-queue prices and min-edge floor.
             has_room = (ask - bid) > (2 * tick)
-            if has_room:
-                top_buy = self._round_price(bid + tick)
-                top_sell = self._round_price(ask - tick)
-            else:
-                top_buy = self._round_price(bid)
-                top_sell = self._round_price(ask)
+            top_buy = (bid + tick) if has_room else bid
+            top_sell = (ask - tick) if has_room else ask
             min_edge = self.min_edge_bps * 1e-4 * mid
-            buy_edge_at_top = mid - top_buy
-            sell_edge_at_top = top_sell - mid
-            edge_buy_ok_at_top = buy_edge_at_top >= min_edge
-            edge_sell_ok_at_top = sell_edge_at_top >= min_edge
 
-            # Decide whether/where to quote each side.
+            # ----- 5. Active flatten when inventory blew past the cap -----
+            # If |inventory| > flatten_threshold_mult * inv_cap, we OVERRIDE the
+            # opposing side to top-of-queue regardless of edge so we actually
+            # close the position. Without this, "skip when at cap" leaves us
+            # holding a toxic position indefinitely after a trend.
+            inv_cap_units = (self.inventory_cap_pct * per_book_wealth / mid) if mid > 0 else float("inf")
+            flatten_threshold = self.flatten_threshold_mult * inv_cap_units
+            urgent_flatten_buy = bs.inventory < -flatten_threshold  # heavily short -> aggressive buy
+            urgent_flatten_sell = bs.inventory > flatten_threshold  # heavily long  -> aggressive sell
+            if urgent_flatten_buy:
+                diag["urgent_flatten_buy"] += 1
+            if urgent_flatten_sell:
+                diag["urgent_flatten_sell"] += 1
+
+            # ----- 5b. Trend-gate: don't add NEW exposure into a strong trend.
+            # Active flatten still runs above so toxic positions still get closed.
+            # The gate only suppresses the side that's getting hit by the trend.
+            trend_thresh = self.trend_pause_bps * 1e-4
+            if bs.ewma_long > 0:
+                trend_ratio = (bs.ewma_short / bs.ewma_long) - 1.0
+            else:
+                trend_ratio = 0.0
+            up_trend = trend_ratio > trend_thresh
+            down_trend = trend_ratio < -trend_thresh
+            # In an up-trend, our sells get picked off. Pause sells unless we
+            # are LONG (then a sell IS a flatten). Mirror for down-trend.
+            trend_pause_sell = up_trend and bs.inventory <= 0
+            trend_pause_buy = down_trend and bs.inventory >= 0
+            if trend_pause_buy:
+                diag["trend_paused_buy"] += 1
+            if trend_pause_sell:
+                diag["trend_paused_sell"] += 1
+
+            # ----- 6. Resolve target_buy -----
+            # Decision tree:
+            #  a) Urgent flatten short -> top_buy at touch (any edge, just close it).
+            #  b) Model wants aggressive (raw_buy >= top_buy AND top_buy has edge) -> top_buy.
+            #  c) Bid level has edge -> bid (join the queue, in line for a fill).
+            #  d) Otherwise: "deeper" mode picks `mid - min_edge` (with skew applied);
+            #     "skip" mode skips the side this cycle.
             quote_buy_edge = True
-            quote_sell_edge = True
-            if edge_buy_ok_at_top:
-                # We can be at top-of-queue with edge. Use the more conservative
-                # of model price and top-of-queue, but never below the bid.
-                target_buy = max(min(target_buy, top_buy), self._round_price(bid))
-                target_buy = min(target_buy, self._round_price(ask - tick))
+            buy_at_top_quote = False
+            if urgent_flatten_buy:
+                target_buy = top_buy
                 buy_at_top_quote = True
+            elif raw_buy >= top_buy and (mid - top_buy) >= min_edge:
+                target_buy = top_buy
+                buy_at_top_quote = True
+            elif (mid - bid) >= min_edge:
+                # Quote at the more conservative of (bid, raw_buy clipped to bid+tick).
+                target_buy = max(min(raw_buy, top_buy), bid)
+                buy_at_top_quote = (target_buy >= top_buy - 0.5 * tick)
             elif self.min_edge_mode == "deeper":
-                # Top-of-queue lacks edge. Quote DEEPER (passive, behind the
-                # touch) at exactly the min-edge level. Won't fill often but
-                # each fill is guaranteed edge >= min_edge_bps.
-                deeper_buy = self._round_price(mid - min_edge)
-                # Must still be a valid post-only price (not crossing).
-                if deeper_buy < ask - 0.5 * tick:
-                    target_buy = deeper_buy
-                    buy_at_top_quote = False
-                else:
-                    quote_buy_edge = False
-                    buy_at_top_quote = False
-            else:  # mode == "skip"
+                # Apply skew to the deeper level so a heavily-short book still
+                # quotes its buy more aggressively than a flat book.
+                target_buy = mid - min_edge - inv_skew_price
+                # Must not cross the ask (post-only would be rejected).
+                if target_buy >= ask - 0.5 * tick:
+                    target_buy = ask - tick  # take top-of-queue when crossed
+                    buy_at_top_quote = True
+            else:
                 quote_buy_edge = False
-                buy_at_top_quote = False
 
-            if edge_sell_ok_at_top:
-                target_sell = min(max(target_sell, top_sell), self._round_price(ask))
-                target_sell = max(target_sell, self._round_price(bid + tick))
+            # ----- 7. Resolve target_sell (mirror of buy logic) -----
+            quote_sell_edge = True
+            sell_at_top_quote = False
+            if urgent_flatten_sell:
+                target_sell = top_sell
                 sell_at_top_quote = True
+            elif raw_sell <= top_sell and (top_sell - mid) >= min_edge:
+                target_sell = top_sell
+                sell_at_top_quote = True
+            elif (ask - mid) >= min_edge:
+                target_sell = min(max(raw_sell, top_sell), ask)
+                sell_at_top_quote = (target_sell <= top_sell + 0.5 * tick)
             elif self.min_edge_mode == "deeper":
-                deeper_sell = self._round_price(mid + min_edge)
-                if deeper_sell > bid + 0.5 * tick:
-                    target_sell = deeper_sell
-                    sell_at_top_quote = False
-                else:
-                    quote_sell_edge = False
-                    sell_at_top_quote = False
+                target_sell = mid + min_edge - inv_skew_price
+                if target_sell <= bid + 0.5 * tick:
+                    target_sell = bid + tick
+                    sell_at_top_quote = True
             else:
                 quote_sell_edge = False
-                sell_at_top_quote = False
 
-            # Final non-crossing safeguard (only matters if both sides quoted).
+            # ----- 8. Round, clamp, and ensure non-crossing -----
+            if quote_buy_edge:
+                target_buy = self._round_price(target_buy)
+                target_buy = min(target_buy, self._round_price(ask - tick))
+            if quote_sell_edge:
+                target_sell = self._round_price(target_sell)
+                target_sell = max(target_sell, self._round_price(bid + tick))
             if quote_buy_edge and quote_sell_edge and target_sell <= target_buy:
                 target_sell = self._round_price(target_buy + tick)
-            # Re-export edge_*_ok in the names used downstream.
+
             edge_buy_ok = quote_buy_edge
             edge_sell_ok = quote_sell_edge
 
@@ -489,17 +563,30 @@ class AdaptiveMarketMakerAgent(FinanceSimulationAgent):
             else:
                 diag["sell_deeper"] += 1
 
-            # ----- 5. Inventory cap AND edge gate: decide whether to quote each side -----
-            inv_cap_units = (self.inventory_cap_pct * per_book_wealth / mid) if mid > 0 else float("inf")
+            # ----- 9. Inventory cap, edge gate, and trend gate combine -----
+            # Note: inv_cap_units was computed in step 5 above. We re-use it here so
+            # the cap and active-flatten thresholds stay in lockstep. Trend gate
+            # only blocks ADDING to exposure into a trend; if urgent_flatten is
+            # firing, that side bypasses the trend gate so we can still close.
             quote_buy = (bs.inventory < inv_cap_units) and edge_buy_ok
             quote_sell = (bs.inventory > -inv_cap_units) and edge_sell_ok
+            if trend_pause_buy and not urgent_flatten_buy:
+                quote_buy = False
+            if trend_pause_sell and not urgent_flatten_sell:
+                quote_sell = False
 
-            # ----- 6. Sizing: keep |inv| under cap so each fill is closeable next cycle -----
-            qty = self._round_qty(self.base_qty)
+            # Bigger size when actively flattening so we close faster. Cap at 2x
+            # base_qty to avoid blowing through balance.
+            base_qty_eff = self.base_qty
+            if urgent_flatten_buy and quote_buy:
+                base_qty_eff = min(self.base_qty * 2.0, abs(bs.inventory))
+            elif urgent_flatten_sell and quote_sell:
+                base_qty_eff = min(self.base_qty * 2.0, abs(bs.inventory))
+            qty = self._round_qty(base_qty_eff)
             if qty <= 0:
                 continue
 
-            # ----- 7. Smart re-quote: only cancel/replace orders that have moved enough -----
+            # ----- 10. Smart re-quote: only cancel/replace orders that have moved enough -----
             tol = self.requote_tolerance_pct * mid
             existing_buys = [o for o in account.orders if int(o.side) == int(OrderDirection.BUY)]
             existing_sells = [o for o in account.orders if int(o.side) == int(OrderDirection.SELL)]
@@ -609,7 +696,9 @@ class AdaptiveMarketMakerAgent(FinanceSimulationAgent):
                 f"skip_edge={diag['sell_skipped_edge']} skip_invcap={diag['sell_skipped_invcap']} "
                 f"skip_bal={diag['sell_skipped_balance']} | "
                 f"inv: long={diag['inv_long_books']} short={diag['inv_short_books']} "
-                f"flat={diag['inv_flat_books']} sum_inv_base={diag['sum_inv_base']:+.2f} | "
+                f"flat={diag['inv_flat_books']} sum_inv_base={diag['sum_inv_base']:+.2f} "
+                f"flatten_buy={diag['urgent_flatten_buy']} flatten_sell={diag['urgent_flatten_sell']} "
+                f"trend_pause_buy={diag['trend_paused_buy']} trend_pause_sell={diag['trend_paused_sell']} | "
                 f"traded_vol={diag['sum_traded_volume']:.0f} cancels={diag['cancels']} "
                 f"instr={len(response.instructions)} resp_ms={elapsed*1000:.0f}"
             )

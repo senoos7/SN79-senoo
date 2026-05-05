@@ -252,15 +252,20 @@ function in `taos/im/validator/reward.py`:
 | `base_half_spread` | `0.0008` | Static component of half-spread. 8 bps default. |
 | `gamma` | `8.0` | Inventory aversion + vol-driven spread widening. `gamma=20` blew quoted spreads to 20%+ on noisy books → no fills. Lower if you see persistent wide quotes. |
 | `vol_window` | `64` | EWMA span (samples) for σ² estimation. |
-| `inventory_cap_pct` | `0.50` | Hard cap on \|inventory\| / per-book capital. Lower values lock us into flatten-only mode after one fill if base_qty is large relative to per-book wealth → kills 24H volume. |
+| `inventory_cap_pct` | `0.20` | Cap on \|inventory\| / per-book capital. Once exceeded, the side that would add to inventory is suppressed. Tighter cap = less max accumulation in trending markets. |
+| `flatten_threshold_mult` | `1.0` | When \|inventory\| > `flatten_threshold_mult * inv_cap`, the offsetting side is forced to top-of-queue regardless of edge to actively close the position. Without this, a one-way market leaves us holding a toxic position indefinitely. |
+| `trend_pause_bps` | `8.0` | When `(short_ewma / long_ewma) - 1 > trend_pause_bps × 1e-4`, the side getting hit by the trend is paused (unless it's a flatten). 8 bps = 0.08% deviation. Lower = more aggressive pausing (less volume, less trend bleed); higher = less pausing. |
+| `trend_ewma_short_alpha` | `0.3` | Smoothing factor for the short-window EWMA of mid (≈3-cycle half-life). Higher = noisier, faster reaction. |
+| `trend_ewma_long_alpha` | `0.05` | Smoothing factor for the long-window EWMA (≈14-cycle half-life). Lower = smoother trend reference. The ratio short/long is what triggers the gate. |
 | `stop_loss_pct` | `0.005` | Flatten inventory if MTM loss > 0.5% of per-book capital. |
 | `vol_pause_pct` | `0.70` | Stop quoting once traded_volume reaches 70% of cap. |
 | `expiry_seconds` | `30` | GTT expiry (sim seconds). MUST exceed publish interval + validator latency. |
 | `max_half_spread_pct` | `0.005` | Ceiling on half-spread (0.5% of mid). Prevents EWMA blowups on noisy books from quoting 20%+ wide and never filling. |
 | `requote_tolerance_pct` | `0.0015` | Re-quote only if target shifts > 15 bps. Bigger = fewer instructions per response = faster decompression on validator side = lower latency penalty. |
 | `capital_turnover_cap` | `1.0` | Mirror of `scoring.activity.capital_turnover_cap`. |
-| `min_edge_bps` | `3.0` | Required edge from mid (basis points) for any quote. Defends against adverse selection at the touch. 10 bps was too tight (most books had spreads <10 bps and we sat out 98% of the simulator). 3 bps lets us participate broadly while still avoiding the worst zero-edge fills. |
-| `min_edge_mode` | `deeper` | What to do when the top-of-queue price doesn't satisfy `min_edge_bps`. `deeper` = quote behind the touch at exactly the edge level (lower fill rate but guaranteed-edge fills). `skip` = don't quote the side this cycle (lowest activity, lowest adverse selection). |
+| `min_edge_bps` | `3.0` | Required edge from mid (basis points) for any quote. Defends against adverse selection at the touch. |
+| `min_edge_mode` | `deeper` | When the touch doesn't satisfy `min_edge_bps`. `deeper` = quote behind the touch at `mid ± min_edge` *with inventory skew applied* (so a heavily-short book quotes its buy more aggressively). `skip` = don't quote the side this cycle. |
+| `base_qty` | `0.2` | BASE units per quote. With per-book wealth ~$390 and inv_cap=0.20, the per-book inventory cap is ~0.26 BASE. base_qty=0.2 lets a fill consume 77% of the cap (was 0.5 before, which was 100%+ of the cap). Smaller per-fill size = more granular inventory control AND smaller adverse-selection losses per fill. |
 | `diag_every` | `20` | Emit a one-line `DIAG c=...` log every N cycles. Now shows `inside` (at top with edge) vs `deeper` (passive at edge level) vs `skip_edge` (no edge possible, skipped). Use this to tune `min_edge_bps`/`min_edge_mode`. Set to a large number to silence. |
 
 To change a knob, edit the `AGENT_PARAMS` row in
