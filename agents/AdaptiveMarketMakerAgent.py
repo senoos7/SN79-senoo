@@ -378,6 +378,10 @@ class AdaptiveMarketMakerAgent(FinanceSimulationAgent):
             # Trend gate: # books where we suppressed a side because of a trend.
             "trend_paused_buy": 0, "trend_paused_sell": 0,
             "sum_traded_volume": 0.0,
+            # GTC order-persistence probe: total existing orders seen this cycle
+            # across all books. Should be > 0 after cycle 1 if GTC orders are
+            # being reflected in state snapshots. Stays 0 → GTC not persisting.
+            "existing_buy_orders": 0, "existing_sell_orders": 0,
         }
 
         for book_id, book in state.books.items():
@@ -479,10 +483,20 @@ class AdaptiveMarketMakerAgent(FinanceSimulationAgent):
                 trend_ratio = 0.0
             up_trend = trend_ratio > trend_thresh
             down_trend = trend_ratio < -trend_thresh
-            # In an up-trend, our sells get picked off. Pause sells unless we
-            # are LONG (then a sell IS a flatten). Mirror for down-trend.
-            trend_pause_sell = up_trend and bs.inventory <= 0
-            trend_pause_buy = down_trend and bs.inventory >= 0
+            # Only pause adding to an ALREADY-ADVERSE position in a trend.
+            # NEVER pause a flat book — we need fills to build any position.
+            #
+            # OLD (broken): `inventory <= 0` fired for flat (0) too, blocking
+            # both sides on ~60% of books when we had no inventory at all.
+            # At c=980: skip_invcap=77 buy + 27 sell = 104/128 books silently
+            # blocked, yet flat=128. The trend gate was the primary blocker.
+            #
+            # NEW: only gates when we already hold inventory in the wrong
+            # direction. Flat books always quote both sides. Adverse positions
+            # still get gated so we don't double down, and the active-flatten
+            # path still closes them aggressively.
+            trend_pause_sell = up_trend and bs.inventory < -1e-9   # SHORT in up-trend
+            trend_pause_buy = down_trend and bs.inventory > 1e-9    # LONG in down-trend
             if trend_pause_buy:
                 diag["trend_paused_buy"] += 1
             if trend_pause_sell:
@@ -610,6 +624,8 @@ class AdaptiveMarketMakerAgent(FinanceSimulationAgent):
             tol = self.requote_tolerance_pct * mid
             existing_buys = [o for o in account.orders if int(o.side) == int(OrderDirection.BUY)]
             existing_sells = [o for o in account.orders if int(o.side) == int(OrderDirection.SELL)]
+            diag["existing_buy_orders"] += len(existing_buys)
+            diag["existing_sell_orders"] += len(existing_sells)
 
             # Cancel buys that are stale or wrong-priced.
             stale_buy_ids = []
@@ -718,6 +734,7 @@ class AdaptiveMarketMakerAgent(FinanceSimulationAgent):
                 f"flatten_buy={diag['urgent_flatten_buy']} flatten_sell={diag['urgent_flatten_sell']} "
                 f"trend_pause_buy={diag['trend_paused_buy']} trend_pause_sell={diag['trend_paused_sell']} | "
                 f"traded_vol={diag['sum_traded_volume']:.0f} cancels={diag['cancels']} "
+                f"existing_buy={diag['existing_buy_orders']} existing_sell={diag['existing_sell_orders']} "
                 f"instr={len(response.instructions)} resp_ms={elapsed*1000:.0f}"
             )
         return response

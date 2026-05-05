@@ -380,6 +380,7 @@ class DirectionalMomentumAgent(FinanceSimulationAgent):
             "books": 0,
             "stop_loss": 0,
             "vol_gated": 0,
+            "max_sigma_seen": 0.0,   # highest sigma observed this cycle (for tuning)
             "long_target": 0, "short_target": 0, "flat_target": 0,
             "inv_long_books": 0, "inv_short_books": 0, "inv_flat_books": 0,
             "buy_placed": 0, "sell_placed": 0,
@@ -435,6 +436,8 @@ class DirectionalMomentumAgent(FinanceSimulationAgent):
 
             # Volatility regime gate: when a book is in a vol blowup, sit out.
             sigma = math.sqrt(bs.sigma2) if bs.sigma2 > 0 else 0.0
+            if sigma > diag["max_sigma_seen"]:
+                diag["max_sigma_seen"] = sigma
             if sigma > self.max_volatility_sigma:
                 rest_ids = [o.id for o in account.orders] if account.orders else []
                 if rest_ids:
@@ -613,7 +616,9 @@ class DirectionalMomentumAgent(FinanceSimulationAgent):
             bt.logging.info(
                 f"DIAG c={self._cycle} miner_wealth={mw:.0f} book_count={bc} "
                 f"per_book_wealth={mw/max(bc,1):.2f} | "
-                f"books={diag['books']} stop_loss={diag['stop_loss']} vol_gated={diag['vol_gated']} | "
+                f"books={diag['books']} stop_loss={diag['stop_loss']} "
+                f"vol_gated={diag['vol_gated']} max_sigma={diag['max_sigma_seen']:.3f} "
+                f"vol_thresh={self.max_volatility_sigma:.3f} | "
                 f"target: long={diag['long_target']} short={diag['short_target']} flat={diag['flat_target']} "
                 f"avg_|alpha|={avg_alpha:.3f} | "
                 f"inv: long={diag['inv_long_books']} short={diag['inv_short_books']} "
