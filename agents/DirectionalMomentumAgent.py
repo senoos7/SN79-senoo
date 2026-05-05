@@ -167,24 +167,34 @@ class DirectionalMomentumAgent(FinanceSimulationAgent):
         self.mom_norm_bps: float = float(getattr(c, "mom_norm_bps", 15.0))
         self.ewma_short_alpha: float = float(getattr(c, "ewma_short_alpha", 0.30))
         self.ewma_long_alpha: float = float(getattr(c, "ewma_long_alpha", 0.05))
-        self.signal_threshold: float = float(getattr(c, "signal_threshold", 0.15))
+        # |alpha| below this -> target inventory = 0 (stay flat).
+        # Empirically the smoothed alpha hovers in [0.07, 0.30] with rare
+        # spikes higher. 0.15 filtered out almost every directional cycle.
+        # 0.08 lets us enter modest positions on most cycles while still
+        # rejecting near-zero noise.
+        self.signal_threshold: float = float(getattr(c, "signal_threshold", 0.08))
         self.signal_power: float = float(getattr(c, "signal_power", 1.5))
         self.alpha_smooth_alpha: float = float(getattr(c, "alpha_smooth_alpha", 0.4))
         # ----- Order placement -----
         self.entry_aggressive_alpha: float = float(getattr(c, "entry_aggressive_alpha", 0.8))
         self.entry_moderate_alpha: float = float(getattr(c, "entry_moderate_alpha", 0.5))
-        # GTT expiry in SIMULATION seconds. Sim time runs accelerated vs real
-        # (~50-100 sim sec per real cycle in production). 30 was too short:
-        # orders expired before any taker could hit them. 120 lets orders
-        # survive 2-3 cycles for real fill opportunity.
-        self.expiry_seconds: int = int(getattr(c, "expiry_seconds", 120))
+        # GTT expiry in SIMULATION seconds. Sim runs accelerated vs real
+        # (~100 sim sec per real cycle in production). 120 was barely one
+        # cycle of survival; 600 (≈5–6 cycles) gives orders a real chance
+        # to be hit by takers.
+        self.expiry_seconds: int = int(getattr(c, "expiry_seconds", 600))
         self.requote_tolerance_pct: float = float(getattr(c, "requote_tolerance_pct", 0.0015))
         # ----- Take profit -----
         self.take_profit_alpha_thresh: float = float(getattr(c, "take_profit_alpha_thresh", 0.10))
         self.exit_offset_bps: float = float(getattr(c, "exit_offset_bps", 8.0))
         # ----- Risk -----
         self.stop_loss_pct: float = float(getattr(c, "stop_loss_pct", 0.01))
-        self.max_volatility_sigma: float = float(getattr(c, "max_volatility_sigma", 0.005))
+        # EWMA std of log-returns above which we sit out a book. Empirically
+        # 0.005 (50 bps per cycle) was way too tight: in production 127/128
+        # books were vol-gated every cycle and we never traded anything.
+        # 0.05 (5% per-cycle return std) only triggers on extreme blowups
+        # while letting normal trading conditions through.
+        self.max_volatility_sigma: float = float(getattr(c, "max_volatility_sigma", 0.05))
         # ----- Volatility EWMA samples (for regime gate) -----
         self.vol_window: int = int(getattr(c, "vol_window", 64))
 

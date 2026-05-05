@@ -141,13 +141,12 @@ class AdaptiveMarketMakerAgent(FinanceSimulationAgent):
         self.flatten_threshold_mult: float = float(getattr(c, "flatten_threshold_mult", 1.0))
         self.stop_loss_pct: float = float(getattr(c, "stop_loss_pct", 0.005))
         self.vol_pause_pct: float = float(getattr(c, "vol_pause_pct", 0.70))
-        # GTT expiry of resting quotes in SIMULATION seconds. The sim runs
-        # accelerated relative to real time (we observed 1 real cycle ≈ 50–100
-        # sim seconds in production). expiry=30 was shorter than a single
-        # publish interval, so orders died before any taker could hit them
-        # (kept_buy=kept_sell=0 every cycle, sum_inv frozen). 120 lets each
-        # order survive 2–3 cycles → real fill opportunity.
-        self.expiry_seconds: int = int(getattr(c, "expiry_seconds", 120))
+        # GTT expiry of resting quotes in SIMULATION seconds. Sim runs
+        # accelerated vs real time (~100 sim sec per real cycle in production).
+        # Empirical observation: at expiry=120 with tight markets, kept=0 every
+        # cycle. The orders were dying before takers could hit them. 600
+        # (≈5–6 cycles) gives a healthy survival window.
+        self.expiry_seconds: int = int(getattr(c, "expiry_seconds", 600))
         # Hard cap on half-spread as a fraction of mid. Quotes wider than this on
         # volatile books simply never get filled, so we'd rather under-protect a
         # bit and actually trade than quote at 25% wide and earn zero RT volume.
@@ -160,11 +159,13 @@ class AdaptiveMarketMakerAgent(FinanceSimulationAgent):
         # Minimum required edge (distance from mid) for any quote, in basis points.
         # If the top-of-queue price gives less edge than this, we either SKIP or
         # quote DEEPER (passive at the edge level), depending on `min_edge_mode`.
-        # Empirically 10 bps was way too tight (only ~2% of books had spread
-        # wide enough to satisfy it -> we sat out the simulator). 3 bps lets us
-        # participate on most books while still defending against the worst
-        # adverse-selection at zero-edge front-of-queue quoting.
-        self.min_edge_bps: float = float(getattr(c, "min_edge_bps", 3.0))
+        # Sequence: 10 bps was way too tight (only ~2% of books satisfied it). 3 bps
+        # was still too tight: the live simulator runs many books with full spread
+        # under 6 bps, so the "deeper" fallback placed orders BELOW the bid and
+        # nothing filled (kept=0 for 23 minutes). 0.5 bps lets the at-touch
+        # branches fire on essentially every book; the inventory cap, active
+        # flatten, and trend gate handle adverse selection downstream.
+        self.min_edge_bps: float = float(getattr(c, "min_edge_bps", 0.5))
         # What to do when a side fails the edge gate at top-of-queue:
         #   "skip"   -> don't quote that side this cycle (lowest activity, lowest AS)
         #   "deeper" -> still quote, but at mid +/- min_edge (behind the touch).
@@ -516,6 +517,14 @@ class AdaptiveMarketMakerAgent(FinanceSimulationAgent):
                 if target_buy >= ask - 0.5 * tick:
                     target_buy = ask - tick  # take top-of-queue when crossed
                     buy_at_top_quote = True
+                # CRITICAL: never sit BEHIND the touch. If the market is tighter
+                # than min_edge, the calculated deeper price is below `bid`,
+                # which means our order rests deeper in the book and never
+                # gets filled (this was the "kept=0 forever" bug). Always join
+                # the queue at top-of-bid in that case.
+                elif target_buy < bid:
+                    target_buy = bid
+                    buy_at_top_quote = True
             else:
                 quote_buy_edge = False
 
@@ -535,6 +544,13 @@ class AdaptiveMarketMakerAgent(FinanceSimulationAgent):
                 target_sell = mid + min_edge - inv_skew_price
                 if target_sell <= bid + 0.5 * tick:
                     target_sell = bid + tick
+                    sell_at_top_quote = True
+                # CRITICAL mirror of buy-side fix: never sit ABOVE the touch
+                # in tight markets. If calculated deeper price > ask, our sell
+                # rests deeper in the book and never fills. Sit AT the ask
+                # instead so we're at the top of the sell queue.
+                elif target_sell > ask:
+                    target_sell = ask
                     sell_at_top_quote = True
             else:
                 quote_sell_edge = False

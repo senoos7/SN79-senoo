@@ -259,12 +259,12 @@ function in `taos/im/validator/reward.py`:
 | `trend_ewma_long_alpha` | `0.05` | Smoothing factor for the long-window EWMA (≈14-cycle half-life). Lower = smoother trend reference. The ratio short/long is what triggers the gate. |
 | `stop_loss_pct` | `0.005` | Flatten inventory if MTM loss > 0.5% of per-book capital. |
 | `vol_pause_pct` | `0.70` | Stop quoting once traded_volume reaches 70% of cap. |
-| `expiry_seconds` | `120` | GTT expiry (sim seconds). The simulator runs accelerated relative to real time (~50–100 sim sec per real cycle). 30 was shorter than a single publish interval, so orders expired before any taker could hit them (`kept_buy=kept_sell=0` every cycle, `sum_inv` frozen). 120 lets each order survive 2–3 cycles for real fill opportunity. |
+| `expiry_seconds` | `600` | GTT expiry (sim seconds). The simulator runs accelerated relative to real time (~100 sim sec per real cycle). 30 was shorter than a single publish interval. 120 was barely one cycle of survival. 600 (≈5–6 cycles) gives orders a real survival window. |
 | `max_half_spread_pct` | `0.005` | Ceiling on half-spread (0.5% of mid). Prevents EWMA blowups on noisy books from quoting 20%+ wide and never filling. |
 | `requote_tolerance_pct` | `0.0015` | Re-quote only if target shifts > 15 bps. Bigger = fewer instructions per response = faster decompression on validator side = lower latency penalty. |
 | `capital_turnover_cap` | `1.0` | Mirror of `scoring.activity.capital_turnover_cap`. |
-| `min_edge_bps` | `3.0` | Required edge from mid (basis points) for any quote. Defends against adverse selection at the touch. |
-| `min_edge_mode` | `deeper` | When the touch doesn't satisfy `min_edge_bps`. `deeper` = quote behind the touch at `mid ± min_edge` *with inventory skew applied* (so a heavily-short book quotes its buy more aggressively). `skip` = don't quote the side this cycle. |
+| `min_edge_bps` | `0.5` | Required edge from mid (basis points) for any quote. 3 bps was wider than typical market half-spread, so the deeper-mode fallback placed quotes BEHIND the touch and never filled. 0.5 bps lets at-touch branches fire on essentially every book; AS is contained by inventory cap + active flatten + trend gate. |
+| `min_edge_mode` | `deeper` | When the touch doesn't satisfy `min_edge_bps`. `deeper` = quote behind the touch at `mid ± min_edge` *with inventory skew applied*; if that price would sit BEHIND the bid/ask, it now clamps to the touch instead (so we always at least join the queue). `skip` = don't quote the side this cycle. |
 | `base_qty` | `0.2` | BASE units per quote. With per-book wealth ~$390 and inv_cap=0.20, the per-book inventory cap is ~0.26 BASE. base_qty=0.2 lets a fill consume 77% of the cap (was 0.5 before, which was 100%+ of the cap). Smaller per-fill size = more granular inventory control AND smaller adverse-selection losses per fill. |
 | `diag_every` | `20` | Emit a one-line `DIAG c=...` log every N cycles. Now shows `inside` (at top with edge) vs `deeper` (passive at edge level) vs `skip_edge` (no edge possible, skipped). Use this to tune `min_edge_bps`/`min_edge_mode`. Set to a large number to silence. |
 
@@ -308,7 +308,7 @@ cd agents/proxy && python proxy.py --config config.json
 # 2) Agent
 cd agents && python AdaptiveMarketMakerAgent.py --port 8888 --agent_id 0 \
     --params base_qty=0.5 base_half_spread=0.0008 gamma=8.0 \
-             stop_loss_pct=0.005 vol_pause_pct=0.70 expiry_seconds=120 \
+             stop_loss_pct=0.005 vol_pause_pct=0.70 expiry_seconds=600 \
              max_half_spread_pct=0.005 requote_tolerance_pct=0.0015
 
 # 3) Simulator
@@ -368,7 +368,7 @@ Every cycle, per book:
 | `min_delta` | `0.1` | Don't place orders unless target − inventory exceeds this. Avoids dust orders. |
 | `obi_weight` / `mom_weight` | `0.5` / `0.5` | Mix between flow imbalance and momentum signals. Should sum to 1.0. |
 | `mom_norm_bps` | `15.0` | Momentum normalization scale (saturation point). Larger = momentum needs to be bigger to dominate. |
-| `signal_threshold` | `0.15` | Below this `\|α\|`, target = 0 (sit flat). Higher → more selective, less activity. |
+| `signal_threshold` | `0.08` | Below this `\|α\|`, target = 0 (sit flat). Empirically smoothed alpha sits in [0.07, 0.30]; 0.15 filtered out almost every cycle. 0.08 lets us take small positions on weak signals while still rejecting near-zero noise. |
 | `signal_power` | `1.5` | Position sizing curve. >1 dampens weak signals' position size. |
 | `alpha_smooth_alpha` | `0.4` | EWMA on alpha itself. Lower = more smoothing (slower reactions, less whipsaw). |
 | `ewma_short_alpha` / `ewma_long_alpha` | `0.30` / `0.05` | Microprice EWMA smoothing factors. Ratio drives `mom_signal`. |
@@ -377,8 +377,8 @@ Every cycle, per book:
 | `take_profit_alpha_thresh` | `0.10` | When alpha weakens below this and we carry inventory, switch to exit mode. |
 | `exit_offset_bps` | `8.0` | Place exit limit at `cost_basis ± 8 bps`. Smaller = exits faster, less profit; larger = patient, may not fill. |
 | `stop_loss_pct` | `0.01` | Per-book hard stop as fraction of per-book wealth. |
-| `max_volatility_sigma` | `0.005` | EWMA sigma threshold. Books in vol blowup = sit out (cancel and skip). |
-| `expiry_seconds` | `120` | GTT expiry of placed orders (sim seconds). Sim runs accelerated; <60 leaves orders expiring before takers reach them. |
+| `max_volatility_sigma` | `0.05` | EWMA sigma threshold (per-cycle log-return std). Books exceeding this sit out. 0.005 was 10× too tight for SN-79 markets — 127/128 books got vol-gated every cycle, so we never traded. 0.05 only gates extreme blowups. |
+| `expiry_seconds` | `600` | GTT expiry of placed orders (sim seconds). Sim runs accelerated; <300 leaves orders expiring before takers reach them. |
 | `requote_tolerance_pct` | `0.0015` | Re-quote only when target shifts > 15 bps of mid. |
 
 ### How to run it as a SECOND miner alongside the market maker
