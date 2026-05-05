@@ -138,12 +138,18 @@ class AdaptiveMarketMakerAgent(FinanceSimulationAgent):
         # quotes rest passively and slashes wire payload.
         self.requote_tolerance_pct: float = float(getattr(c, "requote_tolerance_pct", 0.0015))
         # Minimum required edge (distance from mid) for any quote, in basis points.
-        # If the most aggressive non-crossing price gives less edge than this, we
-        # SKIP that side entirely. Without this gate, the "always quote at touch+1"
-        # logic puts us at front of queue with zero edge -> we get run over by
-        # informed flow on every market move -> negative realized PnL. 10 bps =
-        # 0.10% from mid is a reasonable floor for adverse-selection protection.
-        self.min_edge_bps: float = float(getattr(c, "min_edge_bps", 10.0))
+        # If the top-of-queue price gives less edge than this, we either SKIP or
+        # quote DEEPER (passive at the edge level), depending on `min_edge_mode`.
+        # Empirically 10 bps was way too tight (only ~2% of books had spread
+        # wide enough to satisfy it -> we sat out the simulator). 3 bps lets us
+        # participate on most books while still defending against the worst
+        # adverse-selection at zero-edge front-of-queue quoting.
+        self.min_edge_bps: float = float(getattr(c, "min_edge_bps", 3.0))
+        # What to do when a side fails the edge gate at top-of-queue:
+        #   "skip"   -> don't quote that side this cycle (lowest activity, lowest AS)
+        #   "deeper" -> still quote, but at mid +/- min_edge (behind the touch).
+        #               Order may fill less often but each fill has guaranteed edge.
+        self.min_edge_mode: str = str(getattr(c, "min_edge_mode", "deeper")).lower()
         self.capital_turnover_cap: float = float(getattr(c, "capital_turnover_cap", 1.0))
 
         # Per-book persistent state. Reset on simulation start.
@@ -324,9 +330,9 @@ class AdaptiveMarketMakerAgent(FinanceSimulationAgent):
             "cancels": 0, "kept_buy": 0, "kept_sell": 0,
             "inv_long_books": 0, "inv_short_books": 0, "inv_flat_books": 0,
             "sum_inv_base": 0.0,
-            # Competitiveness: how often we're at the touch vs deeper.
-            "buy_at_touch": 0, "sell_at_touch": 0,
+            # Competitiveness: at-top vs deeper-passive.
             "buy_inside": 0, "sell_inside": 0,
+            "buy_deeper": 0, "sell_deeper": 0,
             "sum_traded_volume": 0.0,
         }
 
@@ -400,15 +406,11 @@ class AdaptiveMarketMakerAgent(FinanceSimulationAgent):
             # COMPETITIVE QUOTING + EDGE GATE.
             #
             # Always-front-of-queue quoting (target = bid+tick / ask-tick) gives
-            # great fill rate but TERRIBLE adverse selection: when an informed
-            # taker hits, our quote is consumed first, and that fill is virtually
-            # always against us (price moves through us right after). Empirically
-            # we observed -$2,395 realized PnL on $4,719 round-trip volume.
-            #
-            # The fix: REQUIRE a minimum edge from mid before quoting. If the
-            # most aggressive non-crossing price (top of queue) gives less edge
-            # than `min_edge_bps`, SKIP that side this cycle. Better to trade
-            # less and profit per trade than to trade often and bleed.
+            # great fill rate but TERRIBLE adverse selection at zero edge.
+            # Always-deep quoting gives great edge but near-zero fill rate.
+            # The middle ground: quote at top-of-queue when the spread allows
+            # at least min_edge there; otherwise quote DEEPER at the edge level
+            # so we still leave a resting order with positive edge protection.
             has_room = (ask - bid) > (2 * tick)
             if has_room:
                 top_buy = self._round_price(bid + tick)
@@ -417,40 +419,75 @@ class AdaptiveMarketMakerAgent(FinanceSimulationAgent):
                 top_buy = self._round_price(bid)
                 top_sell = self._round_price(ask)
             min_edge = self.min_edge_bps * 1e-4 * mid
-            buy_edge = mid - top_buy   # positive when top_buy is below mid
-            sell_edge = top_sell - mid  # positive when top_sell is above mid
-            edge_buy_ok = buy_edge >= min_edge
-            edge_sell_ok = sell_edge >= min_edge
+            buy_edge_at_top = mid - top_buy
+            sell_edge_at_top = top_sell - mid
+            edge_buy_ok_at_top = buy_edge_at_top >= min_edge
+            edge_sell_ok_at_top = sell_edge_at_top >= min_edge
 
-            # If edge is OK, lock onto the top-of-queue price (we'll add inv skew below).
-            # If edge is NOT ok, mark side off — we'll skip placing AND cancel any stale
-            # resting orders on that side so we don't get hit at no-edge prices.
-            if edge_buy_ok:
-                # Take the more conservative of model price and top-of-queue price,
-                # but never go below the existing bid (that just parks us deep).
+            # Decide whether/where to quote each side.
+            quote_buy_edge = True
+            quote_sell_edge = True
+            if edge_buy_ok_at_top:
+                # We can be at top-of-queue with edge. Use the more conservative
+                # of model price and top-of-queue, but never below the bid.
                 target_buy = max(min(target_buy, top_buy), self._round_price(bid))
                 target_buy = min(target_buy, self._round_price(ask - tick))
-            if edge_sell_ok:
+                buy_at_top_quote = True
+            elif self.min_edge_mode == "deeper":
+                # Top-of-queue lacks edge. Quote DEEPER (passive, behind the
+                # touch) at exactly the min-edge level. Won't fill often but
+                # each fill is guaranteed edge >= min_edge_bps.
+                deeper_buy = self._round_price(mid - min_edge)
+                # Must still be a valid post-only price (not crossing).
+                if deeper_buy < ask - 0.5 * tick:
+                    target_buy = deeper_buy
+                    buy_at_top_quote = False
+                else:
+                    quote_buy_edge = False
+                    buy_at_top_quote = False
+            else:  # mode == "skip"
+                quote_buy_edge = False
+                buy_at_top_quote = False
+
+            if edge_sell_ok_at_top:
                 target_sell = min(max(target_sell, top_sell), self._round_price(ask))
                 target_sell = max(target_sell, self._round_price(bid + tick))
-            # Final non-crossing safeguard (only matters if both sides quoted).
-            if edge_buy_ok and edge_sell_ok and target_sell <= target_buy:
-                target_sell = self._round_price(target_buy + tick)
+                sell_at_top_quote = True
+            elif self.min_edge_mode == "deeper":
+                deeper_sell = self._round_price(mid + min_edge)
+                if deeper_sell > bid + 0.5 * tick:
+                    target_sell = deeper_sell
+                    sell_at_top_quote = False
+                else:
+                    quote_sell_edge = False
+                    sell_at_top_quote = False
+            else:
+                quote_sell_edge = False
+                sell_at_top_quote = False
 
-            # Competitiveness telemetry — only meaningful when the edge gate let
-            # us quote the side. "inside" = strictly better than the touch.
+            # Final non-crossing safeguard (only matters if both sides quoted).
+            if quote_buy_edge and quote_sell_edge and target_sell <= target_buy:
+                target_sell = self._round_price(target_buy + tick)
+            # Re-export edge_*_ok in the names used downstream.
+            edge_buy_ok = quote_buy_edge
+            edge_sell_ok = quote_sell_edge
+
+            # Competitiveness telemetry — track where each quote sat:
+            #   skip_edge = side not quoted at all (no edge available, mode=skip)
+            #   inside    = at top-of-queue with edge (best/inside the spread)
+            #   deeper    = behind the touch with edge (mode=deeper fallback)
             if not edge_buy_ok:
                 diag["buy_skipped_edge"] += 1
-            elif has_room and abs(target_buy - top_buy) < tick * 0.5:
+            elif buy_at_top_quote:
                 diag["buy_inside"] += 1
-            elif abs(target_buy - bid) < 1e-9:
-                diag["buy_at_touch"] += 1
+            else:
+                diag["buy_deeper"] += 1
             if not edge_sell_ok:
                 diag["sell_skipped_edge"] += 1
-            elif has_room and abs(target_sell - top_sell) < tick * 0.5:
+            elif sell_at_top_quote:
                 diag["sell_inside"] += 1
-            elif abs(target_sell - ask) < 1e-9:
-                diag["sell_at_touch"] += 1
+            else:
+                diag["sell_deeper"] += 1
 
             # ----- 5. Inventory cap AND edge gate: decide whether to quote each side -----
             inv_cap_units = (self.inventory_cap_pct * per_book_wealth / mid) if mid > 0 else float("inf")
@@ -564,11 +601,11 @@ class AdaptiveMarketMakerAgent(FinanceSimulationAgent):
                 f"per_book_wealth={per_book_wealth:.2f} per_book_cap={per_book_cap:.2f} | "
                 f"books={diag['books']} stop_loss={diag['stop_loss']} vol_gated={diag['vol_gated']} | "
                 f"buy: quoted={diag['buy_quoted']} kept={diag['kept_buy']} "
-                f"inside={diag['buy_inside']} touch={diag['buy_at_touch']} "
+                f"inside={diag['buy_inside']} deeper={diag['buy_deeper']} "
                 f"skip_edge={diag['buy_skipped_edge']} skip_invcap={diag['buy_skipped_invcap']} "
                 f"skip_bal={diag['buy_skipped_balance']} | "
                 f"sell: quoted={diag['sell_quoted']} kept={diag['kept_sell']} "
-                f"inside={diag['sell_inside']} touch={diag['sell_at_touch']} "
+                f"inside={diag['sell_inside']} deeper={diag['sell_deeper']} "
                 f"skip_edge={diag['sell_skipped_edge']} skip_invcap={diag['sell_skipped_invcap']} "
                 f"skip_bal={diag['sell_skipped_balance']} | "
                 f"inv: long={diag['inv_long_books']} short={diag['inv_short_books']} "

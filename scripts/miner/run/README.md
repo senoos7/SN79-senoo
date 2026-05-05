@@ -259,8 +259,9 @@ function in `taos/im/validator/reward.py`:
 | `max_half_spread_pct` | `0.005` | Ceiling on half-spread (0.5% of mid). Prevents EWMA blowups on noisy books from quoting 20%+ wide and never filling. |
 | `requote_tolerance_pct` | `0.0015` | Re-quote only if target shifts > 15 bps. Bigger = fewer instructions per response = faster decompression on validator side = lower latency penalty. |
 | `capital_turnover_cap` | `1.0` | Mirror of `scoring.activity.capital_turnover_cap`. |
-| `min_edge_bps` | `10.0` | Required edge from mid (in basis points) for any quote. If the most aggressive non-crossing price (top of queue) gives less edge than this, the side is skipped this cycle. Trades fewer round-trips but with positive edge instead of being run over by toxic flow at the touch. Lower values = more activity, more adverse selection. Higher values = less activity, less adverse selection. 10 bps = 0.10% from mid is a sane starting point. |
-| `diag_every` | `20` | Emit a one-line `DIAG c=...` log every N cycles showing miner_wealth, per-book wealth, # books quoted/skipped (including `skip_edge`), inventory distribution, response time. Set to a large number to silence. |
+| `min_edge_bps` | `3.0` | Required edge from mid (basis points) for any quote. Defends against adverse selection at the touch. 10 bps was too tight (most books had spreads <10 bps and we sat out 98% of the simulator). 3 bps lets us participate broadly while still avoiding the worst zero-edge fills. |
+| `min_edge_mode` | `deeper` | What to do when the top-of-queue price doesn't satisfy `min_edge_bps`. `deeper` = quote behind the touch at exactly the edge level (lower fill rate but guaranteed-edge fills). `skip` = don't quote the side this cycle (lowest activity, lowest adverse selection). |
+| `diag_every` | `20` | Emit a one-line `DIAG c=...` log every N cycles. Now shows `inside` (at top with edge) vs `deeper` (passive at edge level) vs `skip_edge` (no edge possible, skipped). Use this to tune `min_edge_bps`/`min_edge_mode`. Set to a large number to silence. |
 
 To change a knob, edit the `AGENT_PARAMS` row in
 `scripts/miner/run/run_multi_miner_sn79.sh` and `restart`.
