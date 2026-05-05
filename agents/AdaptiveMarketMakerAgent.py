@@ -141,7 +141,13 @@ class AdaptiveMarketMakerAgent(FinanceSimulationAgent):
         self.flatten_threshold_mult: float = float(getattr(c, "flatten_threshold_mult", 1.0))
         self.stop_loss_pct: float = float(getattr(c, "stop_loss_pct", 0.005))
         self.vol_pause_pct: float = float(getattr(c, "vol_pause_pct", 0.70))
-        self.expiry_seconds: int = int(getattr(c, "expiry_seconds", 30))
+        # GTT expiry of resting quotes in SIMULATION seconds. The sim runs
+        # accelerated relative to real time (we observed 1 real cycle ≈ 50–100
+        # sim seconds in production). expiry=30 was shorter than a single
+        # publish interval, so orders died before any taker could hit them
+        # (kept_buy=kept_sell=0 every cycle, sum_inv frozen). 120 lets each
+        # order survive 2–3 cycles → real fill opportunity.
+        self.expiry_seconds: int = int(getattr(c, "expiry_seconds", 120))
         # Hard cap on half-spread as a fraction of mid. Quotes wider than this on
         # volatile books simply never get filled, so we'd rather under-protect a
         # bit and actually trade than quote at 25% wide and earn zero RT volume.

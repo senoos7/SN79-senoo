@@ -259,7 +259,7 @@ function in `taos/im/validator/reward.py`:
 | `trend_ewma_long_alpha` | `0.05` | Smoothing factor for the long-window EWMA (≈14-cycle half-life). Lower = smoother trend reference. The ratio short/long is what triggers the gate. |
 | `stop_loss_pct` | `0.005` | Flatten inventory if MTM loss > 0.5% of per-book capital. |
 | `vol_pause_pct` | `0.70` | Stop quoting once traded_volume reaches 70% of cap. |
-| `expiry_seconds` | `30` | GTT expiry (sim seconds). MUST exceed publish interval + validator latency. |
+| `expiry_seconds` | `120` | GTT expiry (sim seconds). The simulator runs accelerated relative to real time (~50–100 sim sec per real cycle). 30 was shorter than a single publish interval, so orders expired before any taker could hit them (`kept_buy=kept_sell=0` every cycle, `sum_inv` frozen). 120 lets each order survive 2–3 cycles for real fill opportunity. |
 | `max_half_spread_pct` | `0.005` | Ceiling on half-spread (0.5% of mid). Prevents EWMA blowups on noisy books from quoting 20%+ wide and never filling. |
 | `requote_tolerance_pct` | `0.0015` | Re-quote only if target shifts > 15 bps. Bigger = fewer instructions per response = faster decompression on validator side = lower latency penalty. |
 | `capital_turnover_cap` | `1.0` | Mirror of `scoring.activity.capital_turnover_cap`. |
@@ -308,7 +308,7 @@ cd agents/proxy && python proxy.py --config config.json
 # 2) Agent
 cd agents && python AdaptiveMarketMakerAgent.py --port 8888 --agent_id 0 \
     --params base_qty=0.5 base_half_spread=0.0008 gamma=8.0 \
-             stop_loss_pct=0.005 vol_pause_pct=0.70 expiry_seconds=30 \
+             stop_loss_pct=0.005 vol_pause_pct=0.70 expiry_seconds=120 \
              max_half_spread_pct=0.005 requote_tolerance_pct=0.0015
 
 # 3) Simulator
@@ -322,7 +322,120 @@ periodic `STOP-LOSS firing` / `volume-gated` lines. If you see
 
 ---
 
-## 8. Where to go further
+## 8. Phase 2 — `DirectionalMomentumAgent` (signal-based directional trader)
+
+The market maker (`AdaptiveMarketMakerAgent`) handles continuous quoting and
+captures the activity factor in the score formula. Empirically the rank-#1
+through rank-#5 miners on the live subnet are NOT market makers — they are
+**signal-based directional traders** that take large positions, hold them while
+their signal persists, and harvest profits at favorable prices. Their profile:
+
+- Total volume ≈ $25k/day
+- **Round-trip volume ≈ $400/day (only ~1.5% of total)**
+- Realized PnL ≈ +$12k/day
+- Inventory carried ≈ $1M (large directional bets)
+
+That's the opposite of a market maker (continuous round-trips, near-zero edge).
+`DirectionalMomentumAgent` (`agents/DirectionalMomentumAgent.py`) is built to
+match that profile.
+
+### Strategy
+
+Every cycle, per book:
+
+1. **Signal** = `obi_weight * OBI + mom_weight * mom_signal` ∈ [-1, +1]
+   - `OBI = (bid_qty - ask_qty) / (bid_qty + ask_qty)` (immediate flow pressure)
+   - `mom_signal = clamp((short_ewma_micro / long_ewma_micro - 1) / mom_norm, -1, 1)`
+2. **Smoothed alpha** = EWMA of the raw signal (anti-whipsaw).
+3. **Target inventory** = `sign(α) × |α|^signal_power × target_max_base_per_book`,
+   zeroed out when `|α| < signal_threshold` so we sit flat on noise.
+4. **Order placement**: chip toward target with `chunk_qty` per cycle. Aggression
+   scales with `|α|`:
+   - `|α| ≥ entry_aggressive_alpha` → quote one tick inside the touch
+   - `|α| ≥ entry_moderate_alpha`   → at the touch (best bid/ask)
+   - else → at the touch but patient
+5. **Take profit**: when `|α|` drops below `take_profit_alpha_thresh` AND we
+   carry inventory, place an exit limit at `mid ± exit_offset_bps` from cost
+   basis. We don't chase the exit — we let market come back.
+6. **Risk**: per-book stop-loss + volatility regime gate (`max_volatility_sigma`).
+
+### Tuning knobs (`AGENT_PARAMS[DirectionalMomentumAgent]` in the run script)
+
+| Param | Default | Purpose |
+|---|---:|---|
+| `target_max_base_per_book` | `1.0` | Cap on \|inventory\| per book. With 128 books × 1.0 BASE × ~$300 = ~$38k max gross exposure (~75% of `miner_wealth`). |
+| `chunk_qty` | `0.2` | BASE per single limit order. Smaller = slower position build, lower per-fill risk. |
+| `min_delta` | `0.1` | Don't place orders unless target − inventory exceeds this. Avoids dust orders. |
+| `obi_weight` / `mom_weight` | `0.5` / `0.5` | Mix between flow imbalance and momentum signals. Should sum to 1.0. |
+| `mom_norm_bps` | `15.0` | Momentum normalization scale (saturation point). Larger = momentum needs to be bigger to dominate. |
+| `signal_threshold` | `0.15` | Below this `\|α\|`, target = 0 (sit flat). Higher → more selective, less activity. |
+| `signal_power` | `1.5` | Position sizing curve. >1 dampens weak signals' position size. |
+| `alpha_smooth_alpha` | `0.4` | EWMA on alpha itself. Lower = more smoothing (slower reactions, less whipsaw). |
+| `ewma_short_alpha` / `ewma_long_alpha` | `0.30` / `0.05` | Microprice EWMA smoothing factors. Ratio drives `mom_signal`. |
+| `entry_aggressive_alpha` | `0.8` | Above this, we quote at touch+1 tick (top of queue). |
+| `entry_moderate_alpha` | `0.5` | Above this, we quote AT the touch. |
+| `take_profit_alpha_thresh` | `0.10` | When alpha weakens below this and we carry inventory, switch to exit mode. |
+| `exit_offset_bps` | `8.0` | Place exit limit at `cost_basis ± 8 bps`. Smaller = exits faster, less profit; larger = patient, may not fill. |
+| `stop_loss_pct` | `0.01` | Per-book hard stop as fraction of per-book wealth. |
+| `max_volatility_sigma` | `0.005` | EWMA sigma threshold. Books in vol blowup = sit out (cancel and skip). |
+| `expiry_seconds` | `120` | GTT expiry of placed orders (sim seconds). Sim runs accelerated; <60 leaves orders expiring before takers reach them. |
+| `requote_tolerance_pct` | `0.0015` | Re-quote only when target shifts > 15 bps of mid. |
+
+### How to run it as a SECOND miner alongside the market maker
+
+This is a *second* miner. You need a *second* registered hotkey on netuid 79
+(separate UID on-chain). Steps:
+
+```bash
+source ~/sn-79/.venv/bin/activate
+btcli wallet new_hotkey   --wallet.name superbit-darnsin --wallet.hotkey sn79-miner-2
+btcli subnet register     --wallet.name superbit-darnsin --wallet.hotkey sn79-miner-2 --netuid 79
+```
+
+Then uncomment the second row in the `MINERS` array of
+`scripts/miner/run/run_multi_miner_sn79.sh`:
+
+```bash
+"superbit-darnsin     sn79-miner-2         9002   sn79_miner_2       DirectionalMomentumAgent"
+```
+
+Make sure port `9002` is open inbound on the VPS firewall. Then:
+
+```bash
+./scripts/miner/run/run_multi_miner_sn79.sh restart
+pm2 logs sn79_miner_2 --lines 100 | grep DIAG
+```
+
+The `DIAG` line for this agent is different — it shows alpha distribution,
+target inventory, realized & unrealized PnL totals, and order placement stats.
+A healthy line looks like:
+
+```
+DIAG c=N ... | target: long=42 short=38 flat=48 avg_|alpha|=0.21 |
+   inv: long=35 short=30 flat=63 sum=+1.85 |
+   placed: buy=4 sell=3 tp=2 kept_buy=22 kept_sell=20 skip_bal=0 cancels=11 |
+   realized=+150 unrealized=+45 instr=27 resp_ms=18
+```
+
+What to watch over the first 1–2 hours:
+
+- `realized` should grow positive (the whole point of this strategy).
+- `sum` (total inventory) bounded — should oscillate around 0, never balloon to >100.
+- `target: flat` should be a sizable fraction (50–80 books) — we're picky, not a market maker.
+- `placed` numbers small (5–20 per cycle) — patient, not spammy.
+
+### How they should split labor
+
+`AdaptiveMarketMakerAgent` keeps the activity factor up by trading on every book.
+`DirectionalMomentumAgent` generates positive realized PnL with smaller volume.
+Running both on different UIDs hedges your strategy: if the market is trendy
+the directional miner profits; if it's choppy the maker carries activity. The
+two scores are independent (different on-chain UIDs), so you collect emissions
+on both.
+
+---
+
+## 9. Where to go further
 
 - Read `agents/README.md` end-to-end — it documents every instruction type, the
   state-update structure, the volume cap, and the latency mechanic.
