@@ -119,7 +119,12 @@ class AdaptiveMarketMakerAgent(FinanceSimulationAgent):
         # a 290 mid). gamma=8 keeps spreads workable while still skewing for inventory.
         self.gamma: float = float(getattr(c, "gamma", 8.0))
         self.vol_window: int = int(getattr(c, "vol_window", 64))
-        self.inventory_cap_pct: float = float(getattr(c, "inventory_cap_pct", 0.10))
+        # Inventory cap as fraction of per-book wealth. 0.10 was too tight: with
+        # base_qty=0.5 BASE per fill on a small per-book wealth, a single fill
+        # exceeded the cap, locking us into flatten-only mode on that side. Once
+        # the offsetting fill stalls (queue position, market drift), volume goes
+        # to zero. 0.50 lets ~5-10 fills stack before the gate kicks in.
+        self.inventory_cap_pct: float = float(getattr(c, "inventory_cap_pct", 0.50))
         self.stop_loss_pct: float = float(getattr(c, "stop_loss_pct", 0.005))
         self.vol_pause_pct: float = float(getattr(c, "vol_pause_pct", 0.70))
         self.expiry_seconds: int = int(getattr(c, "expiry_seconds", 30))
@@ -136,13 +141,17 @@ class AdaptiveMarketMakerAgent(FinanceSimulationAgent):
 
         # Per-book persistent state. Reset on simulation start.
         self.book_state: Dict[int, BookState] = {}
+        # Cycle counter for periodic diagnostic logging.
+        self._cycle = 0
+        self._diag_every = int(getattr(c, "diag_every", 20))
 
         bt.logging.info(
             "AdaptiveMarketMakerAgent initialized | "
             f"base_qty={self.base_qty} half_spread={self.base_half_spread} "
             f"max_half_spread_pct={self.max_half_spread_pct} gamma={self.gamma} "
-            f"stop_loss_pct={self.stop_loss_pct} vol_pause_pct={self.vol_pause_pct} "
-            f"expiry_s={self.expiry_seconds} requote_tol={self.requote_tolerance_pct}"
+            f"inv_cap_pct={self.inventory_cap_pct} stop_loss_pct={self.stop_loss_pct} "
+            f"vol_pause_pct={self.vol_pause_pct} expiry_s={self.expiry_seconds} "
+            f"requote_tol={self.requote_tolerance_pct} diag_every={self._diag_every}"
         )
 
     # ------------------------------------------------------------------
@@ -297,6 +306,17 @@ class AdaptiveMarketMakerAgent(FinanceSimulationAgent):
         priceDecimals = self.simulation_config.priceDecimals
         # GTT expiry in simulation nanoseconds.
         expiry_ns = self.expiry_seconds * 1_000_000_000
+        self._cycle += 1
+        # Per-cycle counters for diagnostic logging at end of respond().
+        diag = {
+            "books": 0, "stop_loss": 0, "vol_gated": 0,
+            "buy_quoted": 0, "sell_quoted": 0,
+            "buy_skipped_invcap": 0, "sell_skipped_invcap": 0,
+            "buy_skipped_balance": 0, "sell_skipped_balance": 0,
+            "cancels": 0, "kept_buy": 0, "kept_sell": 0,
+            "inv_long_books": 0, "inv_short_books": 0, "inv_flat_books": 0,
+            "sum_inv_base": 0.0,
+        }
 
         for book_id, book in state.books.items():
             if not book.bids or not book.asks:
@@ -322,12 +342,23 @@ class AdaptiveMarketMakerAgent(FinanceSimulationAgent):
 
             self._update_volatility(bs, mid)
 
+            diag["books"] += 1
+            if bs.inventory > 1e-9:
+                diag["inv_long_books"] += 1
+            elif bs.inventory < -1e-9:
+                diag["inv_short_books"] += 1
+            else:
+                diag["inv_flat_books"] += 1
+            diag["sum_inv_base"] += bs.inventory
+
             # ----- 2. Stop-loss gate -----
             if self._maybe_stop_loss(response, book_id, bs, mid):
                 # Cancel resting quotes on the same book; we are flattening this cycle.
                 rest_ids = [o.id for o in account.orders] if account.orders else []
                 if rest_ids:
                     response.cancel_orders(book_id=book_id, order_ids=rest_ids)
+                    diag["cancels"] += len(rest_ids)
+                diag["stop_loss"] += 1
                 continue
 
             # ----- 3. Volume cap gate -----
@@ -336,10 +367,8 @@ class AdaptiveMarketMakerAgent(FinanceSimulationAgent):
                 rest_ids = [o.id for o in account.orders] if account.orders else []
                 if rest_ids:
                     response.cancel_orders(book_id=book_id, order_ids=rest_ids)
-                bt.logging.info(
-                    f"BOOK {book_id} volume-gated: traded={getattr(account, 'traded_volume', 0)} "
-                    f"cap={per_book_cap}; pulling quotes"
-                )
+                    diag["cancels"] += len(rest_ids)
+                diag["vol_gated"] += 1
                 continue
 
             # ----- 4. Avellaneda-Stoikov style reservation + spread -----
@@ -400,9 +429,16 @@ class AdaptiveMarketMakerAgent(FinanceSimulationAgent):
 
             if stale_buy_ids or stale_sell_ids:
                 response.cancel_orders(book_id=book_id, order_ids=stale_buy_ids + stale_sell_ids)
+                diag["cancels"] += len(stale_buy_ids) + len(stale_sell_ids)
+            if keep_buy:
+                diag["kept_buy"] += 1
+            if keep_sell:
+                diag["kept_sell"] += 1
 
             # ----- 8. Place new buy quote -----
-            if quote_buy and not keep_buy:
+            if not quote_buy:
+                diag["buy_skipped_invcap"] += 1
+            elif not keep_buy:
                 cost = qty * target_buy
                 if account.quote_balance.free >= cost:
                     response.limit_order(
@@ -415,9 +451,14 @@ class AdaptiveMarketMakerAgent(FinanceSimulationAgent):
                         expiryPeriod=expiry_ns,
                         stp=STP.CANCEL_OLDEST,
                     )
+                    diag["buy_quoted"] += 1
+                else:
+                    diag["buy_skipped_balance"] += 1
 
             # ----- 9. Place new sell quote -----
-            if quote_sell and not keep_sell:
+            if not quote_sell:
+                diag["sell_skipped_invcap"] += 1
+            elif not keep_sell:
                 if account.base_balance.free >= qty:
                     response.limit_order(
                         book_id=book_id,
@@ -429,6 +470,9 @@ class AdaptiveMarketMakerAgent(FinanceSimulationAgent):
                         expiryPeriod=expiry_ns,
                         stp=STP.CANCEL_OLDEST,
                     )
+                    diag["sell_quoted"] += 1
+                else:
+                    diag["sell_skipped_balance"] += 1
 
             bs.last_buy_price = target_buy
             bs.last_sell_price = target_sell
@@ -443,6 +487,25 @@ class AdaptiveMarketMakerAgent(FinanceSimulationAgent):
             bt.logging.debug(
                 f"AdaptiveMarketMaker respond() {elapsed*1000:.1f}ms "
                 f"books={len(state.books)} instructions={len(response.instructions)}"
+            )
+
+        # Periodic diagnostic. Tells us at a glance whether we're actually quoting,
+        # which gate is killing us, and what our local inventory tracker thinks.
+        if self._cycle % self._diag_every == 0:
+            mw = float(getattr(self.simulation_config, "miner_wealth", 0.0))
+            bc = int(getattr(self.simulation_config, "book_count", 1))
+            bt.logging.info(
+                f"DIAG c={self._cycle} miner_wealth={mw:.0f} book_count={bc} "
+                f"per_book_wealth={per_book_wealth:.2f} per_book_cap={per_book_cap:.2f} | "
+                f"books={diag['books']} stop_loss={diag['stop_loss']} vol_gated={diag['vol_gated']} | "
+                f"buy: quoted={diag['buy_quoted']} kept={diag['kept_buy']} "
+                f"skip_invcap={diag['buy_skipped_invcap']} skip_bal={diag['buy_skipped_balance']} | "
+                f"sell: quoted={diag['sell_quoted']} kept={diag['kept_sell']} "
+                f"skip_invcap={diag['sell_skipped_invcap']} skip_bal={diag['sell_skipped_balance']} | "
+                f"inv: long_books={diag['inv_long_books']} short_books={diag['inv_short_books']} "
+                f"flat_books={diag['inv_flat_books']} sum_inv_base={diag['sum_inv_base']:+.2f} | "
+                f"cancels={diag['cancels']} instr={len(response.instructions)} "
+                f"resp_ms={elapsed*1000:.0f}"
             )
         return response
 

@@ -79,7 +79,7 @@ LOG_LEVEL="${LOG_LEVEL:-info}"
 declare -A AGENT_PARAMS=(
   # Custom competitive agent (this repo). See agents/AdaptiveMarketMakerAgent.py docstring
   # for what every knob does. Defaults below are conservative; tune after observing fills.
-  [AdaptiveMarketMakerAgent]="base_qty=0.5 base_half_spread=0.0008 gamma=8.0 vol_window=64 inventory_cap_pct=0.10 stop_loss_pct=0.005 vol_pause_pct=0.70 expiry_seconds=30 max_half_spread_pct=0.005 requote_tolerance_pct=0.0015 capital_turnover_cap=1.0"
+  [AdaptiveMarketMakerAgent]="base_qty=0.5 base_half_spread=0.0008 gamma=8.0 vol_window=64 inventory_cap_pct=0.50 stop_loss_pct=0.005 vol_pause_pct=0.70 expiry_seconds=30 max_half_spread_pct=0.005 requote_tolerance_pct=0.0015 capital_turnover_cap=1.0 diag_every=20"
   # Sample agents shipped with the repo
   [SimpleRegressorAgent]="min_quantity=0.1 max_quantity=1.0 expiry_period=200 model=PassiveAggressiveRegressor signal_threshold=0.0025"
   [RandomMakerAgent]="min_quantity=0.1 max_quantity=1.0 expiry_period=200"

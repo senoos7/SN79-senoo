@@ -252,13 +252,14 @@ function in `taos/im/validator/reward.py`:
 | `base_half_spread` | `0.0008` | Static component of half-spread. 8 bps default. |
 | `gamma` | `8.0` | Inventory aversion + vol-driven spread widening. `gamma=20` blew quoted spreads to 20%+ on noisy books → no fills. Lower if you see persistent wide quotes. |
 | `vol_window` | `64` | EWMA span (samples) for σ² estimation. |
-| `inventory_cap_pct` | `0.10` | Hard cap on \|inventory\| / per-book capital. |
+| `inventory_cap_pct` | `0.50` | Hard cap on \|inventory\| / per-book capital. Lower values lock us into flatten-only mode after one fill if base_qty is large relative to per-book wealth → kills 24H volume. |
 | `stop_loss_pct` | `0.005` | Flatten inventory if MTM loss > 0.5% of per-book capital. |
 | `vol_pause_pct` | `0.70` | Stop quoting once traded_volume reaches 70% of cap. |
 | `expiry_seconds` | `30` | GTT expiry (sim seconds). MUST exceed publish interval + validator latency. |
 | `max_half_spread_pct` | `0.005` | Ceiling on half-spread (0.5% of mid). Prevents EWMA blowups on noisy books from quoting 20%+ wide and never filling. |
 | `requote_tolerance_pct` | `0.0015` | Re-quote only if target shifts > 15 bps. Bigger = fewer instructions per response = faster decompression on validator side = lower latency penalty. |
 | `capital_turnover_cap` | `1.0` | Mirror of `scoring.activity.capital_turnover_cap`. |
+| `diag_every` | `20` | Emit a one-line `DIAG c=...` log every N cycles showing miner_wealth, per-book wealth, # books quoted/skipped, inventory distribution, response time. Set to a large number to silence. |
 
 To change a knob, edit the `AGENT_PARAMS` row in
 `scripts/miner/run/run_multi_miner_sn79.sh` and `restart`.
