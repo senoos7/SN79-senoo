@@ -178,23 +178,23 @@ class DirectionalMomentumAgent(FinanceSimulationAgent):
         # ----- Order placement -----
         self.entry_aggressive_alpha: float = float(getattr(c, "entry_aggressive_alpha", 0.8))
         self.entry_moderate_alpha: float = float(getattr(c, "entry_moderate_alpha", 0.5))
-        # GTT expiry in SIMULATION seconds. Sim runs accelerated vs real
-        # (~100 sim sec per real cycle in production). 120 was barely one
-        # cycle of survival; 600 (≈5–6 cycles) gives orders a real chance
-        # to be hit by takers.
-        self.expiry_seconds: int = int(getattr(c, "expiry_seconds", 600))
+        # Orders use GTC (Good-Till-Cancelled). Sim-time runs ~88x real-time
+        # so GTT expiry was unreliable. We manage order lifetime ourselves via
+        # cancel-on-stale logic. expiry_seconds kept for config compat but unused.
+        self.expiry_seconds: int = int(getattr(c, "expiry_seconds", 600))  # unused
         self.requote_tolerance_pct: float = float(getattr(c, "requote_tolerance_pct", 0.0015))
         # ----- Take profit -----
         self.take_profit_alpha_thresh: float = float(getattr(c, "take_profit_alpha_thresh", 0.10))
         self.exit_offset_bps: float = float(getattr(c, "exit_offset_bps", 8.0))
         # ----- Risk -----
         self.stop_loss_pct: float = float(getattr(c, "stop_loss_pct", 0.01))
-        # EWMA std of log-returns above which we sit out a book. Empirically
-        # 0.005 (50 bps per cycle) was way too tight: in production 127/128
-        # books were vol-gated every cycle and we never traded anything.
-        # 0.05 (5% per-cycle return std) only triggers on extreme blowups
-        # while letting normal trading conditions through.
-        self.max_volatility_sigma: float = float(getattr(c, "max_volatility_sigma", 0.05))
+        # EWMA std of per-REAL-CYCLE log-returns above which we sit out a book.
+        # The SN-79 sim runs at ~88x real-time (empirically: ~600 sim sec per
+        # 7 real sec). That means even a "normal" asset shows 10-50% per-cycle
+        # returns, making sigma >> any reasonable threshold. Setting to 1.0
+        # (100% per cycle) effectively disables this gate; any extreme blowup
+        # large enough to trigger it would be a genuine anomaly.
+        self.max_volatility_sigma: float = float(getattr(c, "max_volatility_sigma", 1.0))
         # ----- Volatility EWMA samples (for regime gate) -----
         self.vol_window: int = int(getattr(c, "vol_window", 64))
 
@@ -373,7 +373,6 @@ class DirectionalMomentumAgent(FinanceSimulationAgent):
         t0 = time.time()
         response = FinanceAgentResponse(agent_id=self.uid)
         priceDecimals = int(getattr(self.simulation_config, "priceDecimals", 2))
-        expiry_ns = self.expiry_seconds * 1_000_000_000
         self._cycle += 1
 
         # Diagnostic counters.
@@ -567,8 +566,7 @@ class DirectionalMomentumAgent(FinanceSimulationAgent):
                         quantity=qty,
                         price=price,
                         postOnly=True,
-                        timeInForce=TimeInForce.GTT,
-                        expiryPeriod=expiry_ns,
+                        timeInForce=TimeInForce.GTC,
                         stp=STP.CANCEL_OLDEST,
                     )
                     diag["buy_placed"] += 1
@@ -590,8 +588,7 @@ class DirectionalMomentumAgent(FinanceSimulationAgent):
                         quantity=qty,
                         price=price,
                         postOnly=True,
-                        timeInForce=TimeInForce.GTT,
-                        expiryPeriod=expiry_ns,
+                        timeInForce=TimeInForce.GTC,
                         stp=STP.CANCEL_OLDEST,
                     )
                     diag["sell_placed"] += 1

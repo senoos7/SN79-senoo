@@ -259,7 +259,7 @@ function in `taos/im/validator/reward.py`:
 | `trend_ewma_long_alpha` | `0.05` | Smoothing factor for the long-window EWMA (≈14-cycle half-life). Lower = smoother trend reference. The ratio short/long is what triggers the gate. |
 | `stop_loss_pct` | `0.005` | Flatten inventory if MTM loss > 0.5% of per-book capital. |
 | `vol_pause_pct` | `0.70` | Stop quoting once traded_volume reaches 70% of cap. |
-| `expiry_seconds` | `600` | GTT expiry (sim seconds). The simulator runs accelerated relative to real time (~100 sim sec per real cycle). 30 was shorter than a single publish interval. 120 was barely one cycle of survival. 600 (≈5–6 cycles) gives orders a real survival window. |
+| `expiry_seconds` | `600` | Legacy parameter — no longer used. Orders now use **GTC** (Good-Till-Cancelled). GTT was unreliable because the sim runs ~88× faster than real-time; even 600 sim seconds expired within one 7-second real cycle. GTC orders persist until we cancel them (smart re-quote logic) or they are filled. |
 | `max_half_spread_pct` | `0.005` | Ceiling on half-spread (0.5% of mid). Prevents EWMA blowups on noisy books from quoting 20%+ wide and never filling. |
 | `requote_tolerance_pct` | `0.0015` | Re-quote only if target shifts > 15 bps. Bigger = fewer instructions per response = faster decompression on validator side = lower latency penalty. |
 | `capital_turnover_cap` | `1.0` | Mirror of `scoring.activity.capital_turnover_cap`. |
@@ -377,8 +377,8 @@ Every cycle, per book:
 | `take_profit_alpha_thresh` | `0.10` | When alpha weakens below this and we carry inventory, switch to exit mode. |
 | `exit_offset_bps` | `8.0` | Place exit limit at `cost_basis ± 8 bps`. Smaller = exits faster, less profit; larger = patient, may not fill. |
 | `stop_loss_pct` | `0.01` | Per-book hard stop as fraction of per-book wealth. |
-| `max_volatility_sigma` | `0.05` | EWMA sigma threshold (per-cycle log-return std). Books exceeding this sit out. 0.005 was 10× too tight for SN-79 markets — 127/128 books got vol-gated every cycle, so we never traded. 0.05 only gates extreme blowups. |
-| `expiry_seconds` | `600` | GTT expiry of placed orders (sim seconds). Sim runs accelerated; <300 leaves orders expiring before takers reach them. |
+| `max_volatility_sigma` | `1.0` | EWMA sigma threshold (per-REAL-CYCLE log-return std). The SN-79 sim runs ~88x real-time so even a normal asset shows 10–50% per-cycle returns. 0.005 and 0.05 were both way too tight (127/128 books gated). 1.0 effectively disables the gate; only true blowups (>100% per-cycle return) trigger it. |
+| `expiry_seconds` | `600` | Legacy parameter — no longer used. Orders now use **GTC** (Good-Till-Cancelled) so they persist until explicitly cancelled or filled. GTT was unreliable because sim-time runs ~88× faster than real-time, making any sim-second expiry too short. |
 | `requote_tolerance_pct` | `0.0015` | Re-quote only when target shifts > 15 bps of mid. |
 
 ### How to run it as a SECOND miner alongside the market maker

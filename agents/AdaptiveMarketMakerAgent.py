@@ -141,12 +141,12 @@ class AdaptiveMarketMakerAgent(FinanceSimulationAgent):
         self.flatten_threshold_mult: float = float(getattr(c, "flatten_threshold_mult", 1.0))
         self.stop_loss_pct: float = float(getattr(c, "stop_loss_pct", 0.005))
         self.vol_pause_pct: float = float(getattr(c, "vol_pause_pct", 0.70))
-        # GTT expiry of resting quotes in SIMULATION seconds. Sim runs
-        # accelerated vs real time (~100 sim sec per real cycle in production).
-        # Empirical observation: at expiry=120 with tight markets, kept=0 every
-        # cycle. The orders were dying before takers could hit them. 600
-        # (≈5–6 cycles) gives a healthy survival window.
-        self.expiry_seconds: int = int(getattr(c, "expiry_seconds", 600))
+        # Orders now use GTC (Good-Till-Cancelled). We manage order lifetime
+        # ourselves via smart re-quote logic; the simulator's GTT expiry was
+        # unreliable because sim-time runs at ~88x real-time, so even a 600
+        # sim-second expiry lasted < 1 real cycle (kept=0 forever). expiry_seconds
+        # is kept as a config key for backwards compat but is no longer used.
+        self.expiry_seconds: int = int(getattr(c, "expiry_seconds", 600))  # unused
         # Hard cap on half-spread as a fraction of mid. Quotes wider than this on
         # volatile books simply never get filled, so we'd rather under-protect a
         # bit and actually trade than quote at 25% wide and earn zero RT volume.
@@ -359,8 +359,6 @@ class AdaptiveMarketMakerAgent(FinanceSimulationAgent):
         per_book_cap = self._volume_cap_per_book()
         per_book_wealth = self._miner_wealth_per_book()
         priceDecimals = self.simulation_config.priceDecimals
-        # GTT expiry in simulation nanoseconds.
-        expiry_ns = self.expiry_seconds * 1_000_000_000
         self._cycle += 1
         # Per-cycle counters for diagnostic logging at end of respond().
         diag = {
@@ -652,8 +650,7 @@ class AdaptiveMarketMakerAgent(FinanceSimulationAgent):
                         quantity=qty,
                         price=target_buy,
                         postOnly=True,
-                        timeInForce=TimeInForce.GTT,
-                        expiryPeriod=expiry_ns,
+                        timeInForce=TimeInForce.GTC,
                         stp=STP.CANCEL_OLDEST,
                     )
                     diag["buy_quoted"] += 1
@@ -672,8 +669,7 @@ class AdaptiveMarketMakerAgent(FinanceSimulationAgent):
                         quantity=qty,
                         price=target_sell,
                         postOnly=True,
-                        timeInForce=TimeInForce.GTT,
-                        expiryPeriod=expiry_ns,
+                        timeInForce=TimeInForce.GTC,
                         stp=STP.CANCEL_OLDEST,
                     )
                     diag["sell_quoted"] += 1
