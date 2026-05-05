@@ -316,6 +316,10 @@ class AdaptiveMarketMakerAgent(FinanceSimulationAgent):
             "cancels": 0, "kept_buy": 0, "kept_sell": 0,
             "inv_long_books": 0, "inv_short_books": 0, "inv_flat_books": 0,
             "sum_inv_base": 0.0,
+            # Competitiveness: how often we're at the touch vs deeper.
+            "buy_at_touch": 0, "sell_at_touch": 0,
+            "buy_inside": 0, "sell_inside": 0,
+            "sum_traded_volume": 0.0,
         }
 
         for book_id, book in state.books.items():
@@ -350,6 +354,7 @@ class AdaptiveMarketMakerAgent(FinanceSimulationAgent):
             else:
                 diag["inv_flat_books"] += 1
             diag["sum_inv_base"] += bs.inventory
+            diag["sum_traded_volume"] += float(getattr(account, "traded_volume", 0.0) or 0.0)
 
             # ----- 2. Stop-loss gate -----
             if self._maybe_stop_loss(response, book_id, bs, mid):
@@ -384,17 +389,47 @@ class AdaptiveMarketMakerAgent(FinanceSimulationAgent):
             target_buy = self._round_price(reservation - half_spread)
             target_sell = self._round_price(reservation + half_spread)
 
-            # POST-ONLY safety: a buy must NOT be >= ask (else it crosses and becomes
-            # a taker), a sell must NOT be <= bid. Capping buy at ask-tick / sell at
-            # bid+tick lets our quotes sit INSIDE the existing bid-ask spread and
-            # become the new best bid/ask — front of the priority queue. (Capping at
-            # bid/ask, the previous behavior, parked us at the back of an existing
-            # queue and we essentially never got filled.)
-            target_buy = min(target_buy, ask - tick)
-            target_sell = max(target_sell, bid + tick)
-            # And keep them non-crossing each other.
+            # COMPETITIVE QUOTING. The model's reservation alone parks us deep in
+            # the book (e.g. target_buy=$290 while bid=$299.95) where we never get
+            # filled. We need to be at the *front* of the queue. So we clip both
+            # sides into the inside-the-spread band:
+            #   buy in [bid, ask - tick]   (best bid or one tick inside)
+            #   sell in [bid + tick, ask]  (best ask or one tick inside)
+            # When the existing spread has room (ask-bid > 2*tick), we prefer to
+            # join one tick inside it (becoming the new best). Otherwise we join
+            # the queue at the touch. The inventory-skewed reservation still
+            # picks WHERE in that band we sit, so flattening pressure is kept.
+            has_room = (ask - bid) > (2 * tick)
+            if has_room:
+                inside_buy = self._round_price(bid + tick)
+                inside_sell = self._round_price(ask - tick)
+            else:
+                inside_buy = self._round_price(bid)
+                inside_sell = self._round_price(ask)
+            # Clip buy: at least competitive (>= inside_buy), never crossing (<= ask-tick).
+            target_buy = max(target_buy, inside_buy)
+            target_buy = min(target_buy, self._round_price(ask - tick))
+            # Clip sell: at least competitive (<= inside_sell), never crossing (>= bid+tick).
+            target_sell = min(target_sell, inside_sell)
+            target_sell = max(target_sell, self._round_price(bid + tick))
+            # Final non-crossing safeguard.
             if target_sell <= target_buy:
                 target_sell = self._round_price(target_buy + tick)
+
+            # Competitiveness telemetry. "at_touch" = at the existing best level.
+            # "inside" = strictly inside the existing spread (i.e. better than the touch).
+            if target_buy >= ask - tick - 1e-12:
+                diag["buy_inside"] += 1
+            elif target_buy >= bid - 1e-12 and target_buy > inside_buy - tick - 1e-12 and has_room:
+                diag["buy_inside"] += 1
+            elif abs(target_buy - bid) < 1e-9:
+                diag["buy_at_touch"] += 1
+            if target_sell <= bid + tick + 1e-12:
+                diag["sell_inside"] += 1
+            elif target_sell < inside_sell + tick + 1e-12 and has_room:
+                diag["sell_inside"] += 1
+            elif abs(target_sell - ask) < 1e-9:
+                diag["sell_at_touch"] += 1
 
             # ----- 5. Inventory cap: skew quoting to flatten -----
             inv_cap_units = (self.inventory_cap_pct * per_book_wealth / mid) if mid > 0 else float("inf")
@@ -490,7 +525,8 @@ class AdaptiveMarketMakerAgent(FinanceSimulationAgent):
             )
 
         # Periodic diagnostic. Tells us at a glance whether we're actually quoting,
-        # which gate is killing us, and what our local inventory tracker thinks.
+        # which gate is killing us, what our local inventory tracker thinks, and how
+        # competitive our quotes are vs the existing touch.
         if self._cycle % self._diag_every == 0:
             mw = float(getattr(self.simulation_config, "miner_wealth", 0.0))
             bc = int(getattr(self.simulation_config, "book_count", 1))
@@ -499,13 +535,15 @@ class AdaptiveMarketMakerAgent(FinanceSimulationAgent):
                 f"per_book_wealth={per_book_wealth:.2f} per_book_cap={per_book_cap:.2f} | "
                 f"books={diag['books']} stop_loss={diag['stop_loss']} vol_gated={diag['vol_gated']} | "
                 f"buy: quoted={diag['buy_quoted']} kept={diag['kept_buy']} "
+                f"inside={diag['buy_inside']} touch={diag['buy_at_touch']} "
                 f"skip_invcap={diag['buy_skipped_invcap']} skip_bal={diag['buy_skipped_balance']} | "
                 f"sell: quoted={diag['sell_quoted']} kept={diag['kept_sell']} "
+                f"inside={diag['sell_inside']} touch={diag['sell_at_touch']} "
                 f"skip_invcap={diag['sell_skipped_invcap']} skip_bal={diag['sell_skipped_balance']} | "
-                f"inv: long_books={diag['inv_long_books']} short_books={diag['inv_short_books']} "
-                f"flat_books={diag['inv_flat_books']} sum_inv_base={diag['sum_inv_base']:+.2f} | "
-                f"cancels={diag['cancels']} instr={len(response.instructions)} "
-                f"resp_ms={elapsed*1000:.0f}"
+                f"inv: long={diag['inv_long_books']} short={diag['inv_short_books']} "
+                f"flat={diag['inv_flat_books']} sum_inv_base={diag['sum_inv_base']:+.2f} | "
+                f"traded_vol={diag['sum_traded_volume']:.0f} cancels={diag['cancels']} "
+                f"instr={len(response.instructions)} resp_ms={elapsed*1000:.0f}"
             )
         return response
 
