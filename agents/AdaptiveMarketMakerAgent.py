@@ -137,6 +137,13 @@ class AdaptiveMarketMakerAgent(FinanceSimulationAgent):
         # per response -> 4.5s decompression -> max latency penalty). 15 bps lets
         # quotes rest passively and slashes wire payload.
         self.requote_tolerance_pct: float = float(getattr(c, "requote_tolerance_pct", 0.0015))
+        # Minimum required edge (distance from mid) for any quote, in basis points.
+        # If the most aggressive non-crossing price gives less edge than this, we
+        # SKIP that side entirely. Without this gate, the "always quote at touch+1"
+        # logic puts us at front of queue with zero edge -> we get run over by
+        # informed flow on every market move -> negative realized PnL. 10 bps =
+        # 0.10% from mid is a reasonable floor for adverse-selection protection.
+        self.min_edge_bps: float = float(getattr(c, "min_edge_bps", 10.0))
         self.capital_turnover_cap: float = float(getattr(c, "capital_turnover_cap", 1.0))
 
         # Per-book persistent state. Reset on simulation start.
@@ -313,6 +320,7 @@ class AdaptiveMarketMakerAgent(FinanceSimulationAgent):
             "buy_quoted": 0, "sell_quoted": 0,
             "buy_skipped_invcap": 0, "sell_skipped_invcap": 0,
             "buy_skipped_balance": 0, "sell_skipped_balance": 0,
+            "buy_skipped_edge": 0, "sell_skipped_edge": 0,
             "cancels": 0, "kept_buy": 0, "kept_sell": 0,
             "inv_long_books": 0, "inv_short_books": 0, "inv_flat_books": 0,
             "sum_inv_base": 0.0,
@@ -389,52 +397,65 @@ class AdaptiveMarketMakerAgent(FinanceSimulationAgent):
             target_buy = self._round_price(reservation - half_spread)
             target_sell = self._round_price(reservation + half_spread)
 
-            # COMPETITIVE QUOTING. The model's reservation alone parks us deep in
-            # the book (e.g. target_buy=$290 while bid=$299.95) where we never get
-            # filled. We need to be at the *front* of the queue. So we clip both
-            # sides into the inside-the-spread band:
-            #   buy in [bid, ask - tick]   (best bid or one tick inside)
-            #   sell in [bid + tick, ask]  (best ask or one tick inside)
-            # When the existing spread has room (ask-bid > 2*tick), we prefer to
-            # join one tick inside it (becoming the new best). Otherwise we join
-            # the queue at the touch. The inventory-skewed reservation still
-            # picks WHERE in that band we sit, so flattening pressure is kept.
+            # COMPETITIVE QUOTING + EDGE GATE.
+            #
+            # Always-front-of-queue quoting (target = bid+tick / ask-tick) gives
+            # great fill rate but TERRIBLE adverse selection: when an informed
+            # taker hits, our quote is consumed first, and that fill is virtually
+            # always against us (price moves through us right after). Empirically
+            # we observed -$2,395 realized PnL on $4,719 round-trip volume.
+            #
+            # The fix: REQUIRE a minimum edge from mid before quoting. If the
+            # most aggressive non-crossing price (top of queue) gives less edge
+            # than `min_edge_bps`, SKIP that side this cycle. Better to trade
+            # less and profit per trade than to trade often and bleed.
             has_room = (ask - bid) > (2 * tick)
             if has_room:
-                inside_buy = self._round_price(bid + tick)
-                inside_sell = self._round_price(ask - tick)
+                top_buy = self._round_price(bid + tick)
+                top_sell = self._round_price(ask - tick)
             else:
-                inside_buy = self._round_price(bid)
-                inside_sell = self._round_price(ask)
-            # Clip buy: at least competitive (>= inside_buy), never crossing (<= ask-tick).
-            target_buy = max(target_buy, inside_buy)
-            target_buy = min(target_buy, self._round_price(ask - tick))
-            # Clip sell: at least competitive (<= inside_sell), never crossing (>= bid+tick).
-            target_sell = min(target_sell, inside_sell)
-            target_sell = max(target_sell, self._round_price(bid + tick))
-            # Final non-crossing safeguard.
-            if target_sell <= target_buy:
+                top_buy = self._round_price(bid)
+                top_sell = self._round_price(ask)
+            min_edge = self.min_edge_bps * 1e-4 * mid
+            buy_edge = mid - top_buy   # positive when top_buy is below mid
+            sell_edge = top_sell - mid  # positive when top_sell is above mid
+            edge_buy_ok = buy_edge >= min_edge
+            edge_sell_ok = sell_edge >= min_edge
+
+            # If edge is OK, lock onto the top-of-queue price (we'll add inv skew below).
+            # If edge is NOT ok, mark side off — we'll skip placing AND cancel any stale
+            # resting orders on that side so we don't get hit at no-edge prices.
+            if edge_buy_ok:
+                # Take the more conservative of model price and top-of-queue price,
+                # but never go below the existing bid (that just parks us deep).
+                target_buy = max(min(target_buy, top_buy), self._round_price(bid))
+                target_buy = min(target_buy, self._round_price(ask - tick))
+            if edge_sell_ok:
+                target_sell = min(max(target_sell, top_sell), self._round_price(ask))
+                target_sell = max(target_sell, self._round_price(bid + tick))
+            # Final non-crossing safeguard (only matters if both sides quoted).
+            if edge_buy_ok and edge_sell_ok and target_sell <= target_buy:
                 target_sell = self._round_price(target_buy + tick)
 
-            # Competitiveness telemetry. "at_touch" = at the existing best level.
-            # "inside" = strictly inside the existing spread (i.e. better than the touch).
-            if target_buy >= ask - tick - 1e-12:
-                diag["buy_inside"] += 1
-            elif target_buy >= bid - 1e-12 and target_buy > inside_buy - tick - 1e-12 and has_room:
+            # Competitiveness telemetry — only meaningful when the edge gate let
+            # us quote the side. "inside" = strictly better than the touch.
+            if not edge_buy_ok:
+                diag["buy_skipped_edge"] += 1
+            elif has_room and abs(target_buy - top_buy) < tick * 0.5:
                 diag["buy_inside"] += 1
             elif abs(target_buy - bid) < 1e-9:
                 diag["buy_at_touch"] += 1
-            if target_sell <= bid + tick + 1e-12:
-                diag["sell_inside"] += 1
-            elif target_sell < inside_sell + tick + 1e-12 and has_room:
+            if not edge_sell_ok:
+                diag["sell_skipped_edge"] += 1
+            elif has_room and abs(target_sell - top_sell) < tick * 0.5:
                 diag["sell_inside"] += 1
             elif abs(target_sell - ask) < 1e-9:
                 diag["sell_at_touch"] += 1
 
-            # ----- 5. Inventory cap: skew quoting to flatten -----
+            # ----- 5. Inventory cap AND edge gate: decide whether to quote each side -----
             inv_cap_units = (self.inventory_cap_pct * per_book_wealth / mid) if mid > 0 else float("inf")
-            quote_buy = bs.inventory < inv_cap_units
-            quote_sell = bs.inventory > -inv_cap_units
+            quote_buy = (bs.inventory < inv_cap_units) and edge_buy_ok
+            quote_sell = (bs.inventory > -inv_cap_units) and edge_sell_ok
 
             # ----- 6. Sizing: keep |inv| under cap so each fill is closeable next cycle -----
             qty = self._round_qty(self.base_qty)
@@ -472,7 +493,10 @@ class AdaptiveMarketMakerAgent(FinanceSimulationAgent):
 
             # ----- 8. Place new buy quote -----
             if not quote_buy:
-                diag["buy_skipped_invcap"] += 1
+                # Only attribute the skip to inventory cap if the edge gate already
+                # allowed it (otherwise buy_skipped_edge has already been counted).
+                if edge_buy_ok:
+                    diag["buy_skipped_invcap"] += 1
             elif not keep_buy:
                 cost = qty * target_buy
                 if account.quote_balance.free >= cost:
@@ -492,7 +516,8 @@ class AdaptiveMarketMakerAgent(FinanceSimulationAgent):
 
             # ----- 9. Place new sell quote -----
             if not quote_sell:
-                diag["sell_skipped_invcap"] += 1
+                if edge_sell_ok:
+                    diag["sell_skipped_invcap"] += 1
             elif not keep_sell:
                 if account.base_balance.free >= qty:
                     response.limit_order(
@@ -509,8 +534,12 @@ class AdaptiveMarketMakerAgent(FinanceSimulationAgent):
                 else:
                     diag["sell_skipped_balance"] += 1
 
-            bs.last_buy_price = target_buy
-            bs.last_sell_price = target_sell
+            # Track last quoted prices only when we actually quoted that side; using
+            # a sentinel target value when not quoting could mislead later cycles.
+            if quote_buy:
+                bs.last_buy_price = target_buy
+            if quote_sell:
+                bs.last_sell_price = target_sell
 
         elapsed = time.time() - t0
         if elapsed > 0.25:
@@ -536,10 +565,12 @@ class AdaptiveMarketMakerAgent(FinanceSimulationAgent):
                 f"books={diag['books']} stop_loss={diag['stop_loss']} vol_gated={diag['vol_gated']} | "
                 f"buy: quoted={diag['buy_quoted']} kept={diag['kept_buy']} "
                 f"inside={diag['buy_inside']} touch={diag['buy_at_touch']} "
-                f"skip_invcap={diag['buy_skipped_invcap']} skip_bal={diag['buy_skipped_balance']} | "
+                f"skip_edge={diag['buy_skipped_edge']} skip_invcap={diag['buy_skipped_invcap']} "
+                f"skip_bal={diag['buy_skipped_balance']} | "
                 f"sell: quoted={diag['sell_quoted']} kept={diag['kept_sell']} "
                 f"inside={diag['sell_inside']} touch={diag['sell_at_touch']} "
-                f"skip_invcap={diag['sell_skipped_invcap']} skip_bal={diag['sell_skipped_balance']} | "
+                f"skip_edge={diag['sell_skipped_edge']} skip_invcap={diag['sell_skipped_invcap']} "
+                f"skip_bal={diag['sell_skipped_balance']} | "
                 f"inv: long={diag['inv_long_books']} short={diag['inv_short_books']} "
                 f"flat={diag['inv_flat_books']} sum_inv_base={diag['sum_inv_base']:+.2f} | "
                 f"traded_vol={diag['sum_traded_volume']:.0f} cancels={diag['cancels']} "

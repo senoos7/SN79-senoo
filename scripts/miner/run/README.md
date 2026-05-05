@@ -259,7 +259,8 @@ function in `taos/im/validator/reward.py`:
 | `max_half_spread_pct` | `0.005` | Ceiling on half-spread (0.5% of mid). Prevents EWMA blowups on noisy books from quoting 20%+ wide and never filling. |
 | `requote_tolerance_pct` | `0.0015` | Re-quote only if target shifts > 15 bps. Bigger = fewer instructions per response = faster decompression on validator side = lower latency penalty. |
 | `capital_turnover_cap` | `1.0` | Mirror of `scoring.activity.capital_turnover_cap`. |
-| `diag_every` | `20` | Emit a one-line `DIAG c=...` log every N cycles showing miner_wealth, per-book wealth, # books quoted/skipped, inventory distribution, response time. Set to a large number to silence. |
+| `min_edge_bps` | `10.0` | Required edge from mid (in basis points) for any quote. If the most aggressive non-crossing price (top of queue) gives less edge than this, the side is skipped this cycle. Trades fewer round-trips but with positive edge instead of being run over by toxic flow at the touch. Lower values = more activity, more adverse selection. Higher values = less activity, less adverse selection. 10 bps = 0.10% from mid is a sane starting point. |
+| `diag_every` | `20` | Emit a one-line `DIAG c=...` log every N cycles showing miner_wealth, per-book wealth, # books quoted/skipped (including `skip_edge`), inventory distribution, response time. Set to a large number to silence. |
 
 To change a knob, edit the `AGENT_PARAMS` row in
 `scripts/miner/run/run_multi_miner_sn79.sh` and `restart`.
