@@ -178,11 +178,10 @@ class DirectionalMomentumAgent(FinanceSimulationAgent):
         # ----- Order placement -----
         self.entry_aggressive_alpha: float = float(getattr(c, "entry_aggressive_alpha", 0.8))
         self.entry_moderate_alpha: float = float(getattr(c, "entry_moderate_alpha", 0.5))
-        # GTT expiry in simulation seconds. GTC was tried but orders placed
-        # with GTC never appeared in account.orders the next cycle in this
-        # simulator. Back to GTT; 3600 sim-sec is effectively infinite while
-        # still allowing the engine to clean up stale orders from dead miners.
-        self.expiry_seconds: int = int(getattr(c, "expiry_seconds", 3600))
+        # GTT expiry in REAL seconds (×1e9 = nanoseconds passed to API).
+        # Reference ImbalanceAgent uses 120 real seconds. Taker orders fill
+        # immediately so this is a safety TTL for any unfilled residuals.
+        self.expiry_seconds: int = int(getattr(c, "expiry_seconds", 120))
         self.requote_tolerance_pct: float = float(getattr(c, "requote_tolerance_pct", 0.0015))
         # ----- Take profit -----
         self.take_profit_alpha_thresh: float = float(getattr(c, "take_profit_alpha_thresh", 0.10))
@@ -483,31 +482,28 @@ class DirectionalMomentumAgent(FinanceSimulationAgent):
             is_take_profit = False
 
             if abs(target) < 1e-9 and abs(bs.inventory) >= self.min_delta:
-                # ----- EXIT mode: harvest profit at favorable price -----
-                # Long inventory -> place SELL at mid + exit_offset (above).
-                # Short inventory -> place BUY at mid - exit_offset (below).
-                exit_offset = self.exit_offset_bps * 1e-4 * mid
+                # ----- EXIT mode: close position as TAKER -----
+                # Sell at BID to close long, buy at ASK to close short.
+                # Taker exit guarantees fill immediately (ImbalanceAgent pattern).
                 if bs.inventory > 0:
-                    place_sell_price = max(mid + exit_offset, bs.avg_cost + exit_offset)
+                    place_sell_price = bid   # taker sell → immediate fill
                     place_sell_qty = abs(bs.inventory)
                 else:
-                    place_buy_price = min(mid - exit_offset, bs.avg_cost - exit_offset)
+                    place_buy_price = ask    # taker buy → immediate fill
                     place_buy_qty = abs(bs.inventory)
                 is_take_profit = True
             elif abs(delta) > self.min_delta:
-                # ----- ENTER/ROTATE mode -----
-                # Always place AT the touch (bid for buys, ask for sells).
-                # Previous code placed INSIDE the spread for "aggressive" entries
-                # (ask-tick for buys, bid+tick for sells). In SN-79, takers
-                # only hit the best bid/ask; orders inside a 2+-tick spread
-                # sit forever without filling. At-touch guarantees taker flow
-                # crosses our resting order.
+                # ----- ENTER/ROTATE mode: TAKER -----
+                # Buy at ASK (crosses immediately), sell at BID (crosses immediately).
+                # Root cause of all prior zero-fill runs: postOnly=True at bid/ask
+                # rested orders nobody ever crossed. The reference ImbalanceAgent
+                # uses BUY@ASK / SELL@BID without postOnly → instant fills.
                 qty_to_chunk = min(self.chunk_qty, abs(delta))
                 if delta > 0:
-                    place_buy_price = bid   # join best bid → taker sells hit us
+                    place_buy_price = ask    # taker buy at ask → immediate fill
                     place_buy_qty = qty_to_chunk
                 else:
-                    place_sell_price = ask  # join best ask → taker buys hit us
+                    place_sell_price = bid   # taker sell at bid → immediate fill
                     place_sell_qty = qty_to_chunk
 
             # ----- Order management: cancel/keep existing, place new where needed -----
@@ -543,10 +539,9 @@ class DirectionalMomentumAgent(FinanceSimulationAgent):
                 diag["sell_kept"] += 1
 
             # Place new buy.
+            # Place new buy (TAKER: buy at ask, crosses immediately).
             if place_buy_price is not None and place_buy_qty is not None and not keep_buy:
                 price = self._round_price(place_buy_price)
-                # Post-only safety: never cross the ask.
-                price = min(price, self._round_price(ask - tick))
                 qty = self._round_qty(place_buy_qty)
                 cost = qty * price
                 if qty > 0 and account.quote_balance.free >= cost:
@@ -555,10 +550,9 @@ class DirectionalMomentumAgent(FinanceSimulationAgent):
                         direction=OrderDirection.BUY,
                         quantity=qty,
                         price=price,
-                        postOnly=True,
                         timeInForce=TimeInForce.GTT,
                         expiryPeriod=expiry_ns,
-                        stp=STP.CANCEL_OLDEST,
+                        stp=STP.CANCEL_BOTH,
                     )
                     diag["buy_placed"] += 1
                     if is_take_profit:
@@ -567,10 +561,9 @@ class DirectionalMomentumAgent(FinanceSimulationAgent):
                 else:
                     diag["skipped_balance"] += 1
 
-            # Place new sell.
+            # Place new sell (TAKER: sell at bid, crosses immediately).
             if place_sell_price is not None and place_sell_qty is not None and not keep_sell:
                 price = self._round_price(place_sell_price)
-                price = max(price, self._round_price(bid + tick))
                 qty = self._round_qty(place_sell_qty)
                 if qty > 0 and account.base_balance.free >= qty:
                     response.limit_order(
@@ -578,10 +571,9 @@ class DirectionalMomentumAgent(FinanceSimulationAgent):
                         direction=OrderDirection.SELL,
                         quantity=qty,
                         price=price,
-                        postOnly=True,
                         timeInForce=TimeInForce.GTT,
                         expiryPeriod=expiry_ns,
-                        stp=STP.CANCEL_OLDEST,
+                        stp=STP.CANCEL_BOTH,
                     )
                     diag["sell_placed"] += 1
                     if is_take_profit:

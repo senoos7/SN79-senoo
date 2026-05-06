@@ -141,13 +141,10 @@ class AdaptiveMarketMakerAgent(FinanceSimulationAgent):
         self.flatten_threshold_mult: float = float(getattr(c, "flatten_threshold_mult", 1.0))
         self.stop_loss_pct: float = float(getattr(c, "stop_loss_pct", 0.005))
         self.vol_pause_pct: float = float(getattr(c, "vol_pause_pct", 0.70))
-        # GTT expiry in simulation seconds. The original expiry=30 showed
-        # kept=78 in production (orders persisted across cycles). Switching to
-        # GTC was tried but GTC orders never appeared in account.orders the
-        # next cycle in this simulator — it does not reflect GTC orders back
-        # in state snapshots. Back to GTT with 3600 sim-sec so orders survive
-        # many cycles while still expiring if the miner dies.
-        self.expiry_seconds: int = int(getattr(c, "expiry_seconds", 3600))
+        # GTT expiry in REAL seconds (×1e9 = nanoseconds passed to API).
+        # Reference ImbalanceAgent uses 120 real seconds. Taker orders fill
+        # immediately so this is a safety TTL for any unfilled residuals.
+        self.expiry_seconds: int = int(getattr(c, "expiry_seconds", 120))
         # Hard cap on half-spread as a fraction of mid. Quotes wider than this on
         # volatile books simply never get filled, so we'd rather under-protect a
         # bit and actually trade than quote at 25% wide and earn zero RT volume.
@@ -635,18 +632,22 @@ class AdaptiveMarketMakerAgent(FinanceSimulationAgent):
             diag["existing_buy_orders"] += len(existing_buys)
             diag["existing_sell_orders"] += len(existing_sells)
 
-            # Cancel buys that are stale or wrong-priced.
+            # Cancel buys that are stale. Taker orders cross immediately so
+            # resting orders here are ones that didn't fill (market moved away).
+            # Compare against current ask (our taker price) with tolerance.
+            taker_buy_ref = self._round_price(ask)
+            taker_sell_ref = self._round_price(bid)
             stale_buy_ids = []
             keep_buy = False
             for o in existing_buys:
-                if abs(float(o.price) - target_buy) > tol or not quote_buy:
+                if abs(float(o.price) - taker_buy_ref) > tol or not quote_buy:
                     stale_buy_ids.append(o.id)
                 else:
                     keep_buy = True
             stale_sell_ids = []
             keep_sell = False
             for o in existing_sells:
-                if abs(float(o.price) - target_sell) > tol or not quote_sell:
+                if abs(float(o.price) - taker_sell_ref) > tol or not quote_sell:
                     stale_sell_ids.append(o.id)
                 else:
                     keep_sell = True
@@ -659,44 +660,47 @@ class AdaptiveMarketMakerAgent(FinanceSimulationAgent):
             if keep_sell:
                 diag["kept_sell"] += 1
 
-            # ----- 8. Place new buy quote -----
+            # ----- 8. Place new buy order (TAKER at ask) -----
+            # Key lesson from ImbalanceAgent (the working reference):
+            #   - NO postOnly; buy at ASK price → crosses immediately as a taker
+            #   - postOnly=True caused silent rejections because the live sim has
+            #     no RandomTakerAgents to fill resting maker orders. 4000 cycles
+            #     of postOnly gave zero fills; removing it gives instant fills.
             if not quote_buy:
-                # Only attribute the skip to inventory cap if the edge gate already
-                # allowed it (otherwise buy_skipped_edge has already been counted).
                 if edge_buy_ok:
                     diag["buy_skipped_invcap"] += 1
             elif not keep_buy:
-                cost = qty * target_buy
+                taker_buy_price = self._round_price(ask)   # cross the spread → fill now
+                cost = qty * taker_buy_price
                 if account.quote_balance.free >= cost:
                     response.limit_order(
                         book_id=book_id,
                         direction=OrderDirection.BUY,
                         quantity=qty,
-                        price=target_buy,
-                        postOnly=True,
+                        price=taker_buy_price,
                         timeInForce=TimeInForce.GTT,
                         expiryPeriod=expiry_ns,
-                        stp=STP.CANCEL_OLDEST,
+                        stp=STP.CANCEL_BOTH,
                     )
                     diag["buy_quoted"] += 1
                 else:
                     diag["buy_skipped_balance"] += 1
 
-            # ----- 9. Place new sell quote -----
+            # ----- 9. Place new sell order (TAKER at bid) -----
             if not quote_sell:
                 if edge_sell_ok:
                     diag["sell_skipped_invcap"] += 1
             elif not keep_sell:
+                taker_sell_price = self._round_price(bid)  # cross the spread → fill now
                 if account.base_balance.free >= qty:
                     response.limit_order(
                         book_id=book_id,
                         direction=OrderDirection.SELL,
                         quantity=qty,
-                        price=target_sell,
-                        postOnly=True,
+                        price=taker_sell_price,
                         timeInForce=TimeInForce.GTT,
                         expiryPeriod=expiry_ns,
-                        stp=STP.CANCEL_OLDEST,
+                        stp=STP.CANCEL_BOTH,
                     )
                     diag["sell_quoted"] += 1
                 else:
