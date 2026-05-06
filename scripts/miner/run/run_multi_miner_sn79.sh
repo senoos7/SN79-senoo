@@ -109,7 +109,7 @@ declare -A AGENT_PARAMS=(
 # ----------------------------------------------------------------
 MINERS=(
   # wallet              hotkey            port   pm2-name           agent
-  "superbit-darnsin     sn79-miner-05040     9001   sn79_miner_1       AdaptiveMarketMakerAgent"
+  "superbit-darnsin     sn79-miner-05040     9001   sn79_miner_1       HybridMarketMakerAgent"
   # Phase 2 - register a SECOND hotkey, then uncomment this row to run a
   # directional trader alongside the market maker. Each miner needs its own
   # registered hotkey (separate UID on-chain) and a unique port + pm2-name.
