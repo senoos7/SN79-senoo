@@ -79,12 +79,12 @@ LOG_LEVEL="${LOG_LEVEL:-info}"
 declare -A AGENT_PARAMS=(
   # Custom competitive agent (this repo). See agents/AdaptiveMarketMakerAgent.py docstring
   # for what every knob does. Defaults below are conservative; tune after observing fills.
-  [AdaptiveMarketMakerAgent]="base_qty=0.2 base_half_spread=0.0008 gamma=8.0 vol_window=64 inventory_cap_pct=0.20 flatten_threshold_mult=1.0 stop_loss_pct=0.005 vol_pause_pct=0.70 expiry_seconds=600 max_half_spread_pct=0.005 requote_tolerance_pct=0.0015 min_edge_bps=0.5 min_edge_mode=deeper trend_pause_bps=8.0 trend_ewma_short_alpha=0.3 trend_ewma_long_alpha=0.05 capital_turnover_cap=1.0 diag_every=20"
+  [AdaptiveMarketMakerAgent]="base_qty=0.2 base_half_spread=0.0008 gamma=8.0 vol_window=64 inventory_cap_pct=0.20 flatten_threshold_mult=1.0 stop_loss_pct=0.005 vol_pause_pct=0.70 expiry_seconds=3600 max_half_spread_pct=0.005 requote_tolerance_pct=0.0015 min_edge_bps=0.5 min_edge_mode=deeper trend_pause_bps=8.0 trend_ewma_short_alpha=0.3 trend_ewma_long_alpha=0.05 capital_turnover_cap=1.0 diag_every=20"
   # Phase 2 directional trader (this repo). Modeled on rank-#2 miner profile:
   # high total volume / low round-trip volume / large directional positions /
   # +realized PnL. Designed to complement (not replace) the market maker.
   # See agents/DirectionalMomentumAgent.py for the full strategy + tunables.
-  [DirectionalMomentumAgent]="target_max_base_per_book=1.0 chunk_qty=0.2 min_delta=0.1 obi_weight=0.5 mom_weight=0.5 mom_norm_bps=15.0 signal_threshold=0.08 signal_power=1.5 alpha_smooth_alpha=0.4 ewma_short_alpha=0.30 ewma_long_alpha=0.05 entry_aggressive_alpha=0.8 entry_moderate_alpha=0.5 take_profit_alpha_thresh=0.10 exit_offset_bps=8.0 stop_loss_pct=0.01 max_volatility_sigma=1.0 vol_window=64 expiry_seconds=600 requote_tolerance_pct=0.0015 diag_every=20"
+  [DirectionalMomentumAgent]="target_max_base_per_book=1.0 chunk_qty=0.2 min_delta=0.1 obi_weight=0.5 mom_weight=0.5 mom_norm_bps=15.0 signal_threshold=0.08 signal_power=1.5 alpha_smooth_alpha=0.4 ewma_short_alpha=0.30 ewma_long_alpha=0.05 entry_aggressive_alpha=0.8 entry_moderate_alpha=0.5 take_profit_alpha_thresh=0.10 exit_offset_bps=8.0 stop_loss_pct=0.01 max_volatility_sigma=1.0 vol_window=64 expiry_seconds=3600 requote_tolerance_pct=0.0015 diag_every=20"
   # Sample agents shipped with the repo
   [SimpleRegressorAgent]="min_quantity=0.1 max_quantity=1.0 expiry_period=200 model=PassiveAggressiveRegressor signal_threshold=0.0025"
   [RandomMakerAgent]="min_quantity=0.1 max_quantity=1.0 expiry_period=200"

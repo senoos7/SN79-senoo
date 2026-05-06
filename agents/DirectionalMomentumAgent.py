@@ -178,10 +178,11 @@ class DirectionalMomentumAgent(FinanceSimulationAgent):
         # ----- Order placement -----
         self.entry_aggressive_alpha: float = float(getattr(c, "entry_aggressive_alpha", 0.8))
         self.entry_moderate_alpha: float = float(getattr(c, "entry_moderate_alpha", 0.5))
-        # Orders use GTC (Good-Till-Cancelled). Sim-time runs ~88x real-time
-        # so GTT expiry was unreliable. We manage order lifetime ourselves via
-        # cancel-on-stale logic. expiry_seconds kept for config compat but unused.
-        self.expiry_seconds: int = int(getattr(c, "expiry_seconds", 600))  # unused
+        # GTT expiry in simulation seconds. GTC was tried but orders placed
+        # with GTC never appeared in account.orders the next cycle in this
+        # simulator. Back to GTT; 3600 sim-sec is effectively infinite while
+        # still allowing the engine to clean up stale orders from dead miners.
+        self.expiry_seconds: int = int(getattr(c, "expiry_seconds", 3600))
         self.requote_tolerance_pct: float = float(getattr(c, "requote_tolerance_pct", 0.0015))
         # ----- Take profit -----
         self.take_profit_alpha_thresh: float = float(getattr(c, "take_profit_alpha_thresh", 0.10))
@@ -373,6 +374,7 @@ class DirectionalMomentumAgent(FinanceSimulationAgent):
         t0 = time.time()
         response = FinanceAgentResponse(agent_id=self.uid)
         priceDecimals = int(getattr(self.simulation_config, "priceDecimals", 2))
+        expiry_ns = self.expiry_seconds * 1_000_000_000
         self._cycle += 1
 
         # Diagnostic counters.
@@ -494,33 +496,18 @@ class DirectionalMomentumAgent(FinanceSimulationAgent):
                 is_take_profit = True
             elif abs(delta) > self.min_delta:
                 # ----- ENTER/ROTATE mode -----
+                # Always place AT the touch (bid for buys, ask for sells).
+                # Previous code placed INSIDE the spread for "aggressive" entries
+                # (ask-tick for buys, bid+tick for sells). In SN-79, takers
+                # only hit the best bid/ask; orders inside a 2+-tick spread
+                # sit forever without filling. At-touch guarantees taker flow
+                # crosses our resting order.
                 qty_to_chunk = min(self.chunk_qty, abs(delta))
                 if delta > 0:
-                    # BUY toward target.
-                    if abs(alpha) >= self.entry_aggressive_alpha:
-                        # Top of queue: one tick inside ask.
-                        place_buy_price = ask - tick
-                    elif abs(alpha) >= self.entry_moderate_alpha:
-                        # Inside the spread if there's room, else at bid.
-                        if (ask - bid) > 2 * tick:
-                            place_buy_price = bid + tick
-                        else:
-                            place_buy_price = bid
-                    else:
-                        # Patient: at bid (join the queue, behind any lockstep maker).
-                        place_buy_price = bid
+                    place_buy_price = bid   # join best bid → taker sells hit us
                     place_buy_qty = qty_to_chunk
                 else:
-                    # SELL toward target.
-                    if abs(alpha) >= self.entry_aggressive_alpha:
-                        place_sell_price = bid + tick
-                    elif abs(alpha) >= self.entry_moderate_alpha:
-                        if (ask - bid) > 2 * tick:
-                            place_sell_price = ask - tick
-                        else:
-                            place_sell_price = ask
-                    else:
-                        place_sell_price = ask
+                    place_sell_price = ask  # join best ask → taker buys hit us
                     place_sell_qty = qty_to_chunk
 
             # ----- Order management: cancel/keep existing, place new where needed -----
@@ -569,7 +556,8 @@ class DirectionalMomentumAgent(FinanceSimulationAgent):
                         quantity=qty,
                         price=price,
                         postOnly=True,
-                        timeInForce=TimeInForce.GTC,
+                        timeInForce=TimeInForce.GTT,
+                        expiryPeriod=expiry_ns,
                         stp=STP.CANCEL_OLDEST,
                     )
                     diag["buy_placed"] += 1
@@ -591,7 +579,8 @@ class DirectionalMomentumAgent(FinanceSimulationAgent):
                         quantity=qty,
                         price=price,
                         postOnly=True,
-                        timeInForce=TimeInForce.GTC,
+                        timeInForce=TimeInForce.GTT,
+                        expiryPeriod=expiry_ns,
                         stp=STP.CANCEL_OLDEST,
                     )
                     diag["sell_placed"] += 1

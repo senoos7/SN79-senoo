@@ -141,12 +141,13 @@ class AdaptiveMarketMakerAgent(FinanceSimulationAgent):
         self.flatten_threshold_mult: float = float(getattr(c, "flatten_threshold_mult", 1.0))
         self.stop_loss_pct: float = float(getattr(c, "stop_loss_pct", 0.005))
         self.vol_pause_pct: float = float(getattr(c, "vol_pause_pct", 0.70))
-        # Orders now use GTC (Good-Till-Cancelled). We manage order lifetime
-        # ourselves via smart re-quote logic; the simulator's GTT expiry was
-        # unreliable because sim-time runs at ~88x real-time, so even a 600
-        # sim-second expiry lasted < 1 real cycle (kept=0 forever). expiry_seconds
-        # is kept as a config key for backwards compat but is no longer used.
-        self.expiry_seconds: int = int(getattr(c, "expiry_seconds", 600))  # unused
+        # GTT expiry in simulation seconds. The original expiry=30 showed
+        # kept=78 in production (orders persisted across cycles). Switching to
+        # GTC was tried but GTC orders never appeared in account.orders the
+        # next cycle in this simulator — it does not reflect GTC orders back
+        # in state snapshots. Back to GTT with 3600 sim-sec so orders survive
+        # many cycles while still expiring if the miner dies.
+        self.expiry_seconds: int = int(getattr(c, "expiry_seconds", 3600))
         # Hard cap on half-spread as a fraction of mid. Quotes wider than this on
         # volatile books simply never get filled, so we'd rather under-protect a
         # bit and actually trade than quote at 25% wide and earn zero RT volume.
@@ -359,6 +360,13 @@ class AdaptiveMarketMakerAgent(FinanceSimulationAgent):
         per_book_cap = self._volume_cap_per_book()
         per_book_wealth = self._miner_wealth_per_book()
         priceDecimals = self.simulation_config.priceDecimals
+        # Back to GTT: empirically the original GTT expiry=30 showed kept=78
+        # (orders persisting across cycles). GTC orders never appeared in
+        # account.orders next cycle — this specific simulator doesn't reflect
+        # GTC orders back in state snapshots. 3600 sim-sec ≈ effectively
+        # infinite at any reasonable sim speed; still lets the engine expire
+        # long-abandoned quotes cleanly.
+        expiry_ns = self.expiry_seconds * 1_000_000_000
         self._cycle += 1
         # Per-cycle counters for diagnostic logging at end of respond().
         diag = {
@@ -666,7 +674,8 @@ class AdaptiveMarketMakerAgent(FinanceSimulationAgent):
                         quantity=qty,
                         price=target_buy,
                         postOnly=True,
-                        timeInForce=TimeInForce.GTC,
+                        timeInForce=TimeInForce.GTT,
+                        expiryPeriod=expiry_ns,
                         stp=STP.CANCEL_OLDEST,
                     )
                     diag["buy_quoted"] += 1
@@ -685,7 +694,8 @@ class AdaptiveMarketMakerAgent(FinanceSimulationAgent):
                         quantity=qty,
                         price=target_sell,
                         postOnly=True,
-                        timeInForce=TimeInForce.GTC,
+                        timeInForce=TimeInForce.GTT,
+                        expiryPeriod=expiry_ns,
                         stp=STP.CANCEL_OLDEST,
                     )
                     diag["sell_quoted"] += 1
