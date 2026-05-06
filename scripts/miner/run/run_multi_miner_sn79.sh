@@ -89,6 +89,9 @@ declare -A AGENT_PARAMS=(
   # Replaces postOnly maker pattern that produced zero fills in live subnet.
   # See agents/HybridMarketMakerAgent.py for full parameter docs.
   [HybridMarketMakerAgent]="base_qty=0.2 inventory_cap_pct=0.15 urgent_threshold=0.80 gamma=6.0 vol_window=50 obi_depth=5 obi_weight=0.40 mom_weight=0.40 as_skew_weight=0.20 mom_norm=0.001 as_skew_scale=100.0 ewma_short_alpha=0.30 ewma_long_alpha=0.05 signal_threshold=0.10 stop_loss_pct=0.01 diag_every=20"
+  # V2: clean rewrite — dynamic gamma, trend gate, taker GTT at ask/bid, market SL.
+  # See agents/AdaptiveMarketMakerAgentV2.py for full parameter docs.
+  [AdaptiveMarketMakerAgentV2]="base_qty=0.2 base_half_spread=0.0008 gamma=6.0 inventory_cap_pct=0.18 stop_loss_pct=0.006 vol_window=64 requote_tolerance_pct=0.002 max_half_spread_pct=0.004 diag_every=20"
   # Sample agents shipped with the repo
   [SimpleRegressorAgent]="min_quantity=0.1 max_quantity=1.0 expiry_period=200 model=PassiveAggressiveRegressor signal_threshold=0.0025"
   [RandomMakerAgent]="min_quantity=0.1 max_quantity=1.0 expiry_period=200"
@@ -118,7 +121,7 @@ MINERS=(
   # "superbit-darnsin     sn79-miner-2         9002   sn79_miner_2       DirectionalMomentumAgent"
   # Other built-in samples for reference:
   # "-                  sn79-miner-3      8093   sn79_miner_3       ImbalanceAgent"
-  "superbit-darnsin     sn79-miner-05050     9002   sn79_miner_2       DirectionalMomentumAgent"
+  "superbit-darnsin     sn79-miner-05050     9002   sn79_miner_2       AdaptiveMarketMakerAgentV2"
 )
 
 # ----------------------------------------------------------------
