@@ -85,6 +85,10 @@ declare -A AGENT_PARAMS=(
   # +realized PnL. Designed to complement (not replace) the market maker.
   # See agents/DirectionalMomentumAgent.py for the full strategy + tunables.
   [DirectionalMomentumAgent]="target_max_base_per_book=1.0 chunk_qty=0.2 min_delta=0.1 obi_weight=0.5 mom_weight=0.5 mom_norm_bps=15.0 signal_threshold=0.08 signal_power=1.5 alpha_smooth_alpha=0.4 ewma_short_alpha=0.30 ewma_long_alpha=0.05 entry_aggressive_alpha=0.8 entry_moderate_alpha=0.5 take_profit_alpha_thresh=0.10 exit_offset_bps=8.0 stop_loss_pct=0.01 max_volatility_sigma=1.0 vol_window=64 expiry_seconds=120 requote_tolerance_pct=0.0015 diag_every=20"
+  # Phase 3: OBI + Momentum + AS-skew composite signal → pure IOC taker fills.
+  # Replaces postOnly maker pattern that produced zero fills in live subnet.
+  # See agents/HybridMarketMakerAgent.py for full parameter docs.
+  [HybridMarketMakerAgent]="base_qty=0.2 inventory_cap_pct=0.15 urgent_threshold=0.80 gamma=6.0 vol_window=50 obi_depth=5 obi_weight=0.40 mom_weight=0.40 as_skew_weight=0.20 mom_norm=0.001 as_skew_scale=100.0 ewma_short_alpha=0.30 ewma_long_alpha=0.05 signal_threshold=0.10 stop_loss_pct=0.01 diag_every=20"
   # Sample agents shipped with the repo
   [SimpleRegressorAgent]="min_quantity=0.1 max_quantity=1.0 expiry_period=200 model=PassiveAggressiveRegressor signal_threshold=0.0025"
   [RandomMakerAgent]="min_quantity=0.1 max_quantity=1.0 expiry_period=200"
